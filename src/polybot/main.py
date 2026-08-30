@@ -99,11 +99,12 @@ class SignalEngine:
         with get_session() as session:
             for sig in signals:
                 logger.info(
-                    "LONGSHOT_BIAS %s | %s price=%.4f corrected=%.4f",
+                    "LONGSHOT_BIAS %s | %s price=%.4f corrected=%.4f -> comprar %s",
                     market.question[:60],
                     sig.outcome,
                     sig.outcome_price,
                     sig.corrected_price,
+                    sig.trade_direction,
                 )
                 session.add(
                     Opportunity(
@@ -112,6 +113,7 @@ class SignalEngine:
                         signal_type="longshot_bias",
                         outcome_price=sig.outcome_price,
                         corrected_price=sig.corrected_price,
+                        trade_direction=sig.trade_direction,
                         book_snapshot={
                             "yes": yes_book.top_levels(),
                             "no": no_book.top_levels(),

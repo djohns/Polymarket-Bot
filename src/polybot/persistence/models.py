@@ -33,5 +33,6 @@ class Opportunity(Base):
     # Sesgo favorito-longshot
     outcome_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     corrected_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trade_direction: Mapped[str | None] = mapped_column(String, nullable=True)  # "YES" | "NO"
 
     book_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)

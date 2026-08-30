@@ -137,15 +137,15 @@ tests/
   falta traer todo y ordenar en cliente. Fase 1 sigue sólo mercados
   **binarios** (`outcomes` con exactamente `["Yes", "No"]`); multi-outcome y
   negRisk quedan fuera del scope hasta que se pidan explícitamente.
-- **Ambigüedad sin resolver — dirección del sesgo favorito-longshot**: el
-  informe mezcla dos efectos con implicaciones opuestas (bias clásico: los
-  longshots están sobrevalorados, luego la corrección debería alejarse de
-  0,50; corrección CRRA de Wolfers/Zitzewitz/Manski: el precio ya está sesgado
-  hacia los extremos, hay que corregir hacia 0,50). Se implementó literalmente
-  la instrucción de cálculo del informe ("corrección hacia 0,50"), pero la
-  señal v2 se loguea como informativa, no como regla de trading — **hay que
-  decidir la dirección correcta en el chat del proyecto antes de usarla en
-  Fase 2 (paper trading)**.
+- **Dirección de trading del sesgo favorito-longshot (confirmada)**: se apuesta
+  contra el sesgo en cada extremo, no es "corregir hacia 0,50" en términos de
+  acción. Longshot caro/sobrevalorado (precio < `LONGSHOT_PRICE_LOW`) ->
+  comprar el outcome contrario. Favorito barato/infravalorado (precio >
+  `LONGSHOT_PRICE_HIGH`) -> comprar ese mismo outcome. El cálculo de magnitud
+  (`corrected_probability`, corrección hacia 0,50) sólo estima distancia/
+  severidad de la señal; la dirección de trading es un campo aparte
+  (`trade_direction`) calculado con esta regla. Sigue siendo señal informativa,
+  no ejecutable, hasta Fase 2.
 - **Arquitectura de ingesta implementada**: `gamma_discovery.py` (polling
   periódico, `DISCOVERY_INTERVAL_SECONDS`) + `orderbook.py` (`OrderBookStore`,
   un `OrderBook` por asset_id) + `ws_client.py` (reconexión con backoff
