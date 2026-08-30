@@ -1,0 +1,30 @@
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# DB local
+*.db
+*.sqlite
+*.sqlite3
+/data/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
