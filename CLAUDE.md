@@ -52,13 +52,22 @@ trabajo de fases futuras sin que se pida.
 
 ```
 src/polybot/
-  ingestion/    # WebSocket CLOB (market channel), Gamma discovery, order book local (Fase 1+)
-  signals/      # Detección de arbitraje intra-mercado, sesgo favorito-longshot (Fase 1+)
-  risk/         # Position sizing (Kelly fraccionado), límites por mercado/cluster (Fase 1+)
+  ingestion/
+    gamma_discovery.py  # Polling periódico de mercados binarios activos (Fase 1)
+    orderbook.py         # OrderBook/OrderBookStore: reconstrucción local desde WS (Fase 1)
+    ws_client.py          # Cliente WS canal `market`, reconexión+heartbeat (Fase 1)
+  signals/
+    fees.py       # Estimación de fee taker desde feeSchedule por mercado (Fase 1)
+    arbitrage.py  # Detección arb intra-mercado v1 (Fase 1)
+    longshot.py   # Detección sesgo favorito-longshot v2 (Fase 1, sólo señal informativa)
+  risk/         # Position sizing (Kelly fraccionado), límites por mercado/cluster (Fase 2+)
   execution/    # Firma EIP-712, órdenes límite, manejo de fills (Fase 3+)
-  persistence/  # Modelos SQLAlchemy, oportunidades/órdenes/fills (Fase 1+)
+  persistence/
+    models.py   # Opportunity (SQLAlchemy) — oportunidades/señales detectadas (Fase 1)
+    db.py       # Engine/session SQLite
   dashboard/    # Streamlit/Dash: posiciones, P&L, Brier score (Fase 2+)
-  config.py     # Settings desde .env, URLs de APIs
+  config.py     # Settings desde .env, URLs de APIs, umbrales de señales
+  main.py       # Runner Fase 1: ingesta + señales + persistencia, sin ejecución
 scripts/
   test_connection.py   # Prueba de solo lectura Gamma+CLOB (Fase 0)
 docs/
@@ -100,6 +109,50 @@ tests/
 - **Jurisdicción**: Chile no está restringido por Polymarket (a diferencia de
   Argentina/Brasil). No re-investigar esto salvo que cambie la política de
   Polymarket.
+- **Formato de mensajes del WS `market`** (verificado empíricamente en Fase 1,
+  no está en la documentación oficial con este detalle):
+  - Al suscribirse (`{"assets_ids": [...], "type": "market"}`) el servidor
+    responde con una **lista JSON** de eventos `book` (uno por asset_id), cada
+    uno con `bids`/`asks` como listas de `{"price": str, "size": str}`.
+  - Los updates incrementales llegan como eventos `price_change` (a veces
+    envueltos en lista, a veces objeto suelto — el cliente maneja ambos casos)
+    con `price_changes: [{asset_id, price, size, side, best_bid, best_ask}]`.
+    `side` es `"BUY"`/`"SELL"` (bid/ask respectivamente); `size="0"` significa
+    que ese nivel de precio se vació y hay que eliminarlo del book local.
+  - **Heartbeat real**: no es un frame WS ping/pong estándar. Se manda el
+    string plano `"PING"` cada 10s y el servidor responde `"PONG"` como texto,
+    no JSON — hay que filtrarlo antes de intentar parsear JSON.
+- **Fees por mercado (mejora sobre el informe)**: Gamma devuelve `feeSchedule`
+  (`{rate, exponent, takerOnly, rebateRate}`) **directamente en cada mercado**
+  vía `/markets`, en vivo y por mercado — más preciso que la tabla estática de
+  tasas por categoría del informe técnico (que puede estar desactualizada).
+  Fórmula confirmada: `fee = shares × rate × (price × (1−price))^exponent`
+  (coincide exactamente con el ejemplo del informe para crypto: `rate=0.07` →
+  $1.75 por 100 shares a 50¢). `takerOnly: true` en todos los schedules
+  observados, consistente con "maker paga 0%". Mercados sin `feeSchedule`
+  (ej. algunos de geopolítica) no cobran fee. **Usar siempre este campo en vez
+  de hardcodear tasas por categoría.**
+- **Descubrimiento de mercados**: Gamma `/markets` soporta `order=volume24hr`
+  y `ascending=false` para paginar por volumen desde el servidor — no hace
+  falta traer todo y ordenar en cliente. Fase 1 sigue sólo mercados
+  **binarios** (`outcomes` con exactamente `["Yes", "No"]`); multi-outcome y
+  negRisk quedan fuera del scope hasta que se pidan explícitamente.
+- **Ambigüedad sin resolver — dirección del sesgo favorito-longshot**: el
+  informe mezcla dos efectos con implicaciones opuestas (bias clásico: los
+  longshots están sobrevalorados, luego la corrección debería alejarse de
+  0,50; corrección CRRA de Wolfers/Zitzewitz/Manski: el precio ya está sesgado
+  hacia los extremos, hay que corregir hacia 0,50). Se implementó literalmente
+  la instrucción de cálculo del informe ("corrección hacia 0,50"), pero la
+  señal v2 se loguea como informativa, no como regla de trading — **hay que
+  decidir la dirección correcta en el chat del proyecto antes de usarla en
+  Fase 2 (paper trading)**.
+- **Arquitectura de ingesta implementada**: `gamma_discovery.py` (polling
+  periódico, `DISCOVERY_INTERVAL_SECONDS`) + `orderbook.py` (`OrderBookStore`,
+  un `OrderBook` por asset_id) + `ws_client.py` (reconexión con backoff
+  exponencial, máx. 60s). Si el set de mercados activos cambia entre
+  descubrimientos, se cancela la tarea WS vigente y se abre una nueva sesión
+  con el set actualizado — no hay resuscripción incremental sobre la misma
+  conexión.
 
 ## Convenciones de código
 
