@@ -154,6 +154,36 @@ tests/
   con el set actualizado — no hay resuscripción incremental sobre la misma
   conexión.
 
+## Deploy (Fase 1) — instancia Oracle Cloud
+
+Detalles completos en [docs/deploy.md](docs/deploy.md); resumen de lo no obvio:
+
+- **La instancia es Oracle Linux 9.7, no Ubuntu** (se asumía Ubuntu al
+  planificar). Usuario SSH es **`opc`**, no `ubuntu`. Package manager: `dnf`.
+  Hostname heredado del proyecto anterior: `btc-strategy6-demo` (no se
+  renombró, es sólo un hostname interno de la VM).
+- **Instancia reutilizada**: tenía un bot de trading de Binance Futures
+  (`btc-strategy6.service`) corriendo en modo testnet, sin posiciones
+  abiertas. Se confirmó con el usuario y se borró por completo (servicio,
+  unit file, `/opt/btc_strategy6_bot`, todos los backups en `/home/opc`)
+  antes de instalar este proyecto.
+- **RAM muy limitada (498 MiB, shape `VM.Standard.E2.1.Micro`)**: `dnf` se
+  queda sin memoria y lo mata el OOM killer con la config por defecto. Fix:
+  `vm.swappiness=100` (quedó aplicado a nivel runtime, no es persistente
+  entre reboots — si hace falta reinstalar algo con `dnf` después de un
+  reboot, volver a correr `sudo sysctl -w vm.swappiness=100` primero) +
+  deshabilitar repos no esenciales (`ol9_ksplice`, `ol9_UEKR8`,
+  `ol9_oci_included`, `ol9_addons`) + `--setopt=install_weak_deps=False
+  --setopt=tsflags=nodocs`. El bot en sí no tiene este problema (~50-70 MB
+  RSS en producción con 100 mercados/200 assets).
+- **Trampa SELinux**: un unit file de systemd copiado vía `/tmp` (scp + mv)
+  hereda el contexto `user_tmp_t` y systemd dice "Unit file does not exist"
+  aunque el archivo exista — hace falta `restorecon` antes de `enable`.
+- **Repo**: se pasó a público en GitHub para simplificar el clone desde el
+  VPS (no se configuró deploy key ni PAT). Servicio: `polymarket-bot.service`,
+  en `/opt/polymarket-bot`, corre como usuario `opc` (no root), `.env` con
+  permisos 600, defaults vacíos de Fase 1 (sin credenciales de trading).
+
 ## Convenciones de código
 
 - Python 3.11+, gestionado con `pyproject.toml` (no `requirements.txt`).
