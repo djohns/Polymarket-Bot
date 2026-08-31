@@ -172,6 +172,13 @@ async def run() -> None:
             current_ids = new_ids
             ws_task = await _run_ws_session(new_markets, store)
 
+            active_asset_ids = {
+                tid for m in new_markets for tid in (m.yes_token_id, m.no_token_id)
+            }
+            purged = store.keep_only(active_asset_ids)
+            if purged:
+                logger.info("OrderBookStore: purgados %d books de assets fuera del set activo", purged)
+
 
 if __name__ == "__main__":
     asyncio.run(run())

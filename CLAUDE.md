@@ -153,6 +153,22 @@ tests/
   descubrimientos, se cancela la tarea WS vigente y se abre una nueva sesión
   con el set actualizado — no hay resuscripción incremental sobre la misma
   conexión.
+- **Memory leak corregido (detectado en revisión de salud, 8.5h de RSS
+  52.7MB → 103.5MB)**: `OrderBookStore` se crea una única vez en `run()` y se
+  reutiliza en cada resuscripción del WS, pero nunca se purgaban los
+  `OrderBook` de assets que salían del top-N por volumen cuando el set de
+  mercados rotaba (rota seguido: 5 veces en 1h vista en los logs). Sin cota,
+  esto habría llevado a OOM en la instancia de 498MB antes de completar la
+  semana de acumulación de Fase 1. Fix: `OrderBookStore.keep_only(active_ids)`
+  purga los books fuera del set activo, llamado en `run()` cada vez que el
+  set de mercados cambia (después de abrir la nueva sesión WS). Validado en
+  vivo en la VPS tras reiniciar el servicio: RSS subió de 58.2MB a ~91MB en
+  los primeros ~55 min (llenado inicial normal de 200 order books desde
+  cero, con 5 purgas confirmadas en los logs durante ese período), y luego
+  quedó **plana 11 minutos seguidos** en 91.3MB antes de un incremento
+  marginal (+0.9MB) — comportamiento de meseta acotada, muy distinto del
+  crecimiento lineal sin techo observado antes del fix (+6.4MB/hora sobre
+  8.5h sin ninguna meseta).
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 

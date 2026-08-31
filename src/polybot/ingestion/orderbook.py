@@ -47,6 +47,13 @@ class OrderBookStore:
     def get(self, asset_id: str) -> OrderBook | None:
         return self._books.get(asset_id)
 
+    def keep_only(self, active_asset_ids: set[str]) -> int:
+        """Purga los books de assets que ya no están en el set activo. Devuelve cuántos se eliminaron."""
+        stale = [aid for aid in self._books if aid not in active_asset_ids]
+        for aid in stale:
+            del self._books[aid]
+        return len(stale)
+
     def handle_message(self, data: dict) -> set[str]:
         """Aplica un mensaje del WS (evento `book` o `price_change`). Devuelve los asset_ids afectados."""
         event_type = data.get("event_type")
