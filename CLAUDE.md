@@ -33,14 +33,21 @@ matan el margen, y cualquier cosa que dependa de velocidad sub-segundo.
 
 ## Fases (ver plan de ejecución para detalle completo)
 
-- **Fase 0 (actual)**: scaffolding del repo, `CLAUDE.md`, conexión de solo
+- **Fase 0**: scaffolding del repo, `CLAUDE.md`, conexión de solo
   lectura a Gamma/CLOB. Sin trading real, sin private key.
 - **Fase 1**: ingesta WebSocket (canal `market`), motor de señales (arb
   intra-mercado v1, sesgo favorito-longshot v2), persistencia de oportunidades
   detectadas. Sin ejecutar nada real.
-- **Fase 2**: paper trading (fills simulados contra order book real), dashboard
-  v1, Kelly fraccionado (¼) simulado. Umbral de salida: Brier <0,20, P&L neto
+- **Fase 2 (actual)**: paper trading. Umbral de salida: Brier <0,20, P&L neto
   positivo, margen de arb consistente >6%.
+  - **Parte 1 (hecha)**: simulador de ejecución (fills hipotéticos de arb
+    contra el order book real, con slippage por profundidad) + position
+    sizing ("fórmula de ganancia garantizada" para arb, Kelly fraccionado ¼
+    como primitiva lista para señales futuras de edge incierto). Ver sección
+    dedicada más abajo.
+  - **Parte 2 (pendiente)**: tracking de resolución real de mercados y Brier
+    score.
+  - **Parte 3 (pendiente)**: dashboard.
 - **Fase 3**: vivo con capital mínimo (decenas–cientos de USDC). Ejecución
   real firmada, kill-switch, wallet con private key cifrada en reposo.
 - **Fase 4**: escalado condicional (drawdown real ≤ 2× simulado).
@@ -60,14 +67,17 @@ src/polybot/
     fees.py       # Estimación de fee taker desde feeSchedule por mercado (Fase 1)
     arbitrage.py  # Detección arb intra-mercado v1 (Fase 1)
     longshot.py   # Detección sesgo favorito-longshot v2 (Fase 1, sólo señal informativa)
-  risk/         # Position sizing (Kelly fraccionado), límites por mercado/cluster (Fase 2+)
-  execution/    # Firma EIP-712, órdenes límite, manejo de fills (Fase 3+)
+  risk/
+    kelly.py    # Kelly fraccionado (¼) — primitiva reusable, NO usada por el arb (Fase 2)
+    sizing.py   # Tope de capital para arb: "fórmula de ganancia garantizada" (Fase 2)
+  execution/
+    simulator.py  # Simulador de fills de arb contra el order book real, sin firmar (Fase 2)
   persistence/
-    models.py   # Opportunity (SQLAlchemy) — oportunidades/señales detectadas (Fase 1)
+    models.py   # Opportunity (señales Fase 1) + SimulatedPosition (fills simulados, Fase 2)
     db.py       # Engine/session SQLite
-  dashboard/    # Streamlit/Dash: posiciones, P&L, Brier score (Fase 2+)
+  dashboard/    # Streamlit/Dash: posiciones, P&L, Brier score (Fase 2, parte 3)
   config.py     # Settings desde .env, URLs de APIs, umbrales de señales
-  main.py       # Runner Fase 1: ingesta + señales + persistencia, sin ejecución
+  main.py       # Runner: ingesta + señales + simulador de ejecución, sin trading real
 scripts/
   test_connection.py   # Prueba de solo lectura Gamma+CLOB (Fase 0)
 docs/
@@ -169,6 +179,72 @@ tests/
   marginal (+0.9MB) — comportamiento de meseta acotada, muy distinto del
   crecimiento lineal sin techo observado antes del fix (+6.4MB/hora sobre
   8.5h sin ninguna meseta).
+
+## Fase 2, parte 1 — simulador de ejecución + position sizing
+
+- **Sizing de arb: NO usa Kelly (decisión explícita, confirmada con el usuario).**
+  El informe técnico distingue dos reglas en la sección de modelo estadístico:
+  *"baskets bloqueados (arb puro) usan fórmula de ganancia garantizada; todo lo
+  demás usa cuarto de Kelly"*. El arb "long" (comprar YES+NO<$1) paga $1
+  garantizado al vencimiento sin importar el resultado — no hay probabilidad
+  incierta que ponderar, así que aplicarle Kelly sería forzar una fórmula que el
+  propio informe dice que no corresponde. `risk/kelly.py` implementa
+  `fractional_kelly(p, price, fraction)` = `(p − price) / (1 − price) × fracción`
+  (Kelly estándar para apuesta binaria) como primitiva lista para cuando se
+  ejecute una señal de edge incierto en una fase futura (ej. favorito-longshot),
+  pero **hoy no la invoca nadie** — el arb usa en cambio
+  `risk/sizing.py::max_capital_for_arb_trade`.
+- **"Fórmula de ganancia garantizada" (sizing real del arb)**: no pondera por
+  probabilidad — maximiza el tamaño rentable disponible en el book, acotado por
+  límites de exposición (capital total, por mercado, por cluster). El tope de
+  capital para una posición nueva es el mínimo entre: `ARB_CAPITAL_BASE ×
+  ARB_MAX_FRACTION_PER_TRADE` (tope por trade), y el espacio restante hasta
+  `ARB_CAPITAL_BASE × ARB_MAX_EXPOSURE_PER_MARKET` / `× ARB_MAX_EXPOSURE_PER_CLUSTER`
+  descontando la exposición ya abierta (`SimulatedPosition.status == "abierta"`,
+  sumada vía SQL agregado, nunca cargando filas a Python — ver lección de la
+  sesión de análisis de cierre de Fase 1). Los límites acotan por riesgo real
+  (disputa de oráculo, lock-up de capital hasta resolución, ejecución no
+  atómica — ver sección de riesgos del informe), no porque el edge en sí sea
+  incierto.
+- **Simulación de fill con profundidad real (`execution/simulator.py`)**: camina
+  los niveles ask de YES y NO en paralelo (1 share de cada uno por unidad de
+  arb comprada). El precio marginal de cada libro es no decreciente al avanzar
+  en profundidad, así que se sigue acumulando tamaño mientras el borde neto
+  (precio marginal + fee, contra el payout de $1) siga siendo positivo, hasta
+  agotar la profundidad de cualquiera de los dos books o el tope de capital —
+  lo que ocurra primero. Reporta por separado: `cost_usd` (capital
+  comprometido), `fee_estimate`, `slippage_estimate` (= costo real − costo al
+  mejor precio, ambos ×tamaño), `gross_pnl` (= shares − cost_usd, el payout
+  garantizado menos el costo) y `net_pnl` (= gross_pnl − fee_estimate).
+- **P&L no se marca realizado**: por instrucción explícita del usuario, aunque
+  `gross_pnl`/`net_pnl` son matemáticamente el resultado bloqueado de un basket
+  YES+NO completamente lleno (determinístico salvo riesgo de oráculo/ejecución),
+  `SimulatedPosition` se persiste con `status="abierta"` y `realized_pnl=NULL`.
+  La confirmación de resolución real (y el cierre de la posición) se implementa
+  en la parte 2 de Fase 2.
+- **Criterio de "cluster correlacionado" elegido**: `MarketInfo.cluster_id` usa
+  el campo `events[0].id` que Gamma ya devuelve en cada mercado (el evento
+  agrupador — ej. todas las carreras de un partido de tenis, o todos los
+  candidatos de una elección, comparten un mismo `events[].id`). Si un mercado
+  no pertenece a ningún evento, `cluster_id` cae a su propio `condition_id`
+  (cluster de tamaño 1). Es el criterio más simple disponible sin lógica nueva
+  de NLP/similaridad, y se apoya en una agrupación que Polymarket ya mantiene
+  editorialmente.
+- **El fill se dispara con el mismo cooldown que la señal de arb** (`SignalEngine`,
+  `OPPORTUNITY_LOG_COOLDOWN_SECONDS`, default 30s): evita abrir una posición
+  simulada nueva en cada tick del book mientras persiste el mismo mispricing.
+  Es auto-limitante además por los topes de exposición: una vez que un mercado o
+  cluster llega a su límite, `max_capital_for_arb_trade` devuelve 0 y no se abren
+  más posiciones ahí hasta que el cooldown expire en otro ciclo Y haya espacio
+  libre (posiciones cerradas, aún no implementado en esta parte).
+- **Nueva tabla `simulated_positions`** (`persistence/models.py`), separada de
+  `opportunities` (Fase 1, que sigue registrando toda detección igual que antes,
+  sin cambios). Fase 1 no se interrumpe: el simulador se engancha al mismo
+  evento (`_check_arbitrage`), no reemplaza el logging existente.
+- **Variables nuevas en `.env`** (todas con default razonable):
+  `ARB_CAPITAL_BASE` (1000.0), `ARB_MAX_FRACTION_PER_TRADE` (0.05),
+  `ARB_MAX_EXPOSURE_PER_MARKET` (0.10), `ARB_MAX_EXPOSURE_PER_CLUSTER` (0.20),
+  `KELLY_FRACTION` (0.25, sin uso activo por ahora).
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 

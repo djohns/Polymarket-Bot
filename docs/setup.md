@@ -30,6 +30,11 @@ lectura pública de Gamma/CLOB, sin autenticación de trading.
 | `DISCOVERY_INTERVAL_SECONDS` | Frecuencia de re-descubrimiento de mercados en Gamma | No (default 120) |
 | `DISCOVERY_MARKET_LIMIT` | Nº de mercados binarios activos a seguir (por volumen 24h) | No (default 100) |
 | `OPPORTUNITY_LOG_COOLDOWN_SECONDS` | Anti-flood: mínimo entre logs repetidos del mismo mercado+señal | No (default 30) |
+| `ARB_CAPITAL_BASE` | Capital base simulado (USD) para sizing de arb (Fase 2) | No (default 1000.0) |
+| `ARB_MAX_FRACTION_PER_TRADE` | Fracción máxima del capital base por posición de arb | No (default 0.05) |
+| `ARB_MAX_EXPOSURE_PER_MARKET` | Exposición abierta máxima (fracción) por mercado | No (default 0.10) |
+| `ARB_MAX_EXPOSURE_PER_CLUSTER` | Exposición abierta máxima (fracción) por cluster de eventos | No (default 0.20) |
+| `KELLY_FRACTION` | Fracción de Kelly para señales de edge incierto (sin uso activo hoy) | No (default 0.25) |
 
 ## Probar la conexión de solo lectura
 
@@ -55,8 +60,10 @@ python -m polybot.main
 Corre indefinidamente: descubre mercados binarios activos (por volumen 24h),
 mantiene su order book local vía WebSocket, y loguea cada arbitraje
 intra-mercado (`ARB_THRESHOLD`) y señal de sesgo favorito-longshot detectada.
-Dejarlo corriendo ≥1 semana es el objetivo de esta fase, antes de pasar a
-paper trading.
+Desde Fase 2 parte 1, cada arbitraje neto viable también dispara un fill
+simulado contra el order book real (tabla `simulated_positions`) — sin firmar
+ni enviar nada. Ver CLAUDE.md, sección "Fase 2, parte 1" para el detalle del
+sizing y la simulación.
 
 ## Estructura del repo
 

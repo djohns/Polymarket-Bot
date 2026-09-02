@@ -5,12 +5,15 @@ import asyncio
 import logging
 import time
 
+from sqlalchemy import func, select
+
 from polybot.config import settings
+from polybot.execution.simulator import simulate_arbitrage_fill
 from polybot.ingestion.gamma_discovery import MarketInfo, fetch_active_markets
 from polybot.ingestion.orderbook import OrderBookStore
 from polybot.ingestion.ws_client import MarketWebSocketClient
 from polybot.persistence.db import get_session, init_db
-from polybot.persistence.models import Opportunity
+from polybot.persistence.models import Opportunity, SimulatedPosition
 from polybot.signals.arbitrage import detect_arbitrage
 from polybot.signals.longshot import detect_longshot_bias
 
@@ -80,6 +83,42 @@ class SignalEngine:
                     },
                 )
             )
+
+            market_exposure = _open_exposure(session, market_id=market.condition_id)
+            cluster_exposure = _open_exposure(session, cluster_id=market.cluster_id)
+            fill = simulate_arbitrage_fill(market, yes_book, no_book, market_exposure, cluster_exposure)
+            if fill is not None:
+                logger.info(
+                    "FILL SIMULADO %s | shares=%.2f costo=%.2f fee=%.4f slippage=%.4f net_pnl=%.4f",
+                    market.question[:60],
+                    fill.shares,
+                    fill.cost_usd,
+                    fill.fee_estimate,
+                    fill.slippage_estimate,
+                    fill.net_pnl,
+                )
+                session.add(
+                    SimulatedPosition(
+                        market_id=market.condition_id,
+                        cluster_id=market.cluster_id,
+                        question=market.question,
+                        shares=fill.shares,
+                        yes_price_avg=fill.yes_price_avg,
+                        no_price_avg=fill.no_price_avg,
+                        yes_price_best=fill.yes_price_best,
+                        no_price_best=fill.no_price_best,
+                        cost_usd=fill.cost_usd,
+                        fee_estimate=fill.fee_estimate,
+                        gross_pnl=fill.gross_pnl,
+                        slippage_estimate=fill.slippage_estimate,
+                        net_pnl=fill.net_pnl,
+                        book_snapshot={
+                            "yes": yes_book.top_levels(),
+                            "no": no_book.top_levels(),
+                        },
+                    )
+                )
+
             session.commit()
 
     def _check_longshot(self, market, yes_book, no_book) -> None:
@@ -121,6 +160,18 @@ class SignalEngine:
                     )
                 )
             session.commit()
+
+
+def _open_exposure(session, *, market_id: str | None = None, cluster_id: str | None = None) -> float:
+    """Suma `cost_usd` de posiciones simuladas abiertas, vía SQL agregado (nunca .all())."""
+    stmt = select(func.coalesce(func.sum(SimulatedPosition.cost_usd), 0.0)).where(
+        SimulatedPosition.status == "abierta"
+    )
+    if market_id is not None:
+        stmt = stmt.where(SimulatedPosition.market_id == market_id)
+    if cluster_id is not None:
+        stmt = stmt.where(SimulatedPosition.cluster_id == cluster_id)
+    return session.execute(stmt).scalar_one()
 
 
 def _midpoint(book) -> float | None:

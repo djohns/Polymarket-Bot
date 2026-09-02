@@ -48,5 +48,12 @@ class Settings:
     discovery_market_limit: int = _int_env("DISCOVERY_MARKET_LIMIT", 100)
     opportunity_log_cooldown_seconds: int = _int_env("OPPORTUNITY_LOG_COOLDOWN_SECONDS", 30)
 
+    # Fase 2: simulador de ejecución + position sizing
+    arb_capital_base: float = _float_env("ARB_CAPITAL_BASE", 1000.0)
+    arb_max_fraction_per_trade: float = _float_env("ARB_MAX_FRACTION_PER_TRADE", 0.05)
+    arb_max_exposure_per_market: float = _float_env("ARB_MAX_EXPOSURE_PER_MARKET", 0.10)
+    arb_max_exposure_per_cluster: float = _float_env("ARB_MAX_EXPOSURE_PER_CLUSTER", 0.20)
+    kelly_fraction: float = _float_env("KELLY_FRACTION", 0.25)
+
 
 settings = Settings()
