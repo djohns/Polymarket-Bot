@@ -59,5 +59,8 @@ class Settings:
     resolution_check_interval_seconds: int = _int_env("RESOLUTION_CHECK_INTERVAL_SECONDS", 900)
     resolution_stale_after_days: int = _int_env("RESOLUTION_STALE_AFTER_DAYS", 7)
 
+    # Fase 2: dashboard (reporte HTML estático, regenerado por systemd timer -- no es un server vivo)
+    dashboard_output_path: str = os.getenv("DASHBOARD_OUTPUT_PATH", "data/dashboard.html")
+
 
 settings = Settings()

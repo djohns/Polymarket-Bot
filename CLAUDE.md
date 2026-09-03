@@ -48,7 +48,9 @@ matan el margen, y cualquier cosa que dependa de velocidad sub-segundo.
   - **Parte 2 (hecha)**: tracking de resolución real de mercados (cierre de
     posiciones de arb con P&L realizado) y Brier score (sólo aplica a
     longshot, no a arb — ver sección dedicada más abajo).
-  - **Parte 3 (pendiente)**: dashboard.
+  - **Parte 3 (hecha)**: dashboard — reporte HTML estático regenerado por
+    systemd timer, no un server vivo (Streamlit descartado por RAM). Ver
+    sección dedicada más abajo.
 - **Fase 3**: vivo con capital mínimo (decenas–cientos de USDC). Ejecución
   real firmada, kill-switch, wallet con private key cifrada en reposo.
 - **Fase 4**: escalado condicional (drawdown real ≤ 2× simulado).
@@ -79,7 +81,10 @@ src/polybot/
   persistence/
     models.py   # Opportunity + SimulatedPosition (Fase 2 p.1) + SignalResolution (Fase 2 p.2)
     db.py       # Engine/session SQLite
-  dashboard/    # Streamlit/Dash: posiciones, P&L, Brier score (Fase 2, parte 3)
+  dashboard/
+    snapshot.py  # Agregados SQL -> dataclass Snapshot (Fase 2, parte 3)
+    render.py    # Snapshot -> HTML autocontenido (SVG a mano, sin dependencias)
+    report.py    # Job puntual: genera y escribe data/dashboard.html a disco
   config.py     # Settings desde .env, URLs de APIs, umbrales de señales
   main.py       # Runner: ingesta + señales + simulador de ejecución, sin trading real
 scripts/
@@ -363,6 +368,80 @@ tests/
   este SQLite.
 - **Variables nuevas en `.env`**: `RESOLUTION_CHECK_INTERVAL_SECONDS` (900),
   `RESOLUTION_STALE_AFTER_DAYS` (7).
+
+## Fase 2, parte 3 — dashboard
+
+- **Decisión: reporte HTML estático regenerado periódicamente, NO un server
+  vivo (Streamlit/Dash descartado).** Justificación con el contexto de
+  recursos de la VPS (498MB RAM, ya con un memory leak corregido y un susto
+  de memoria por una query pesada en sesiones anteriores):
+  - Streamlit por sí solo tiene un footprint base de ~80-150MB de RSS sólo
+    por el framework, más lo que retenga en `session_state` — sumado al bot
+    (~50-90MB ya observados en producción), es una fracción grande y
+    **permanente** de 498MB para un dashboard que probablemente se mira
+    unas pocas veces por semana, no continuamente.
+  - Un server vivo necesita: puerto abierto (más superficie en una VM ya
+    endurecida), manejo de acceso concurrente a un SQLite que no está en modo
+    WAL por defecto (mismo problema de "database is locked" que ya se vio en
+    la sesión de análisis de cierre de Fase 1), y otro proceso systemd
+    corriendo 24/7 compitiendo por RAM con el bot en todo momento, no sólo
+    cuando alguien mira el dashboard.
+  - Un job puntual (`systemd.timer` + `.service` tipo `oneshot`) que corre,
+    consulta agregados SQL, escribe un HTML y termina, tiene **footprint de
+    RAM cero fuera de su propia ejecución** (segundos), que es exactamente
+    el patrón que ya funciona bien para el job de resolución (parte 2) y
+    para el bot principal.
+  - El archivo resultante es HTML autocontenido (CSS inline, gráficos en SVG
+    generado a mano en `dashboard/render.py`, sin JS ni librerías externas)
+    — se puede abrir localmente sin conexión, sin depender de que la VPS
+    esté sirviendo nada en ese momento.
+- **Cómo se regenera**: `polymarket-bot-dashboard.timer` (systemd,
+  `OnUnitActiveSec=15min`, `Persistent=true`) dispara
+  `polymarket-bot-dashboard.service` (`Type=oneshot`), que corre
+  `python -m polybot.dashboard.report` y escribe `data/dashboard.html`. Sin
+  RAM persistente: mismo patrón que el resto del proyecto (no se introdujo
+  ninguna herramienta nueva, sólo otro par service+timer junto al que ya
+  existía).
+- **Cómo se ve desde el chat del proyecto**: el timer en la VPS mantiene el
+  archivo fresco, pero no hay forma de que un HTML estático en un servidor
+  privado "avise" solo al chat. El flujo es: pedirle a Claude Code que traiga
+  la última versión (`scp`) y la publique como Artifact — eso da una vista
+  pulida en el chat bajo demanda, sin mantener nada corriendo. Alternativa
+  sin depender de Claude Code: `scp` directo y abrir el archivo local.
+- **Modo WAL en SQLite** (`persistence/db.py`): se agregó `PRAGMA
+  journal_mode=WAL` + `PRAGMA busy_timeout=5000` en el evento `connect` del
+  engine. Antes, el modo por defecto (rollback journal) causaba que
+  cualquier lector concurrente con el bot escribiendo pudiera fallar con
+  "database is locked" — ya pasó más de una vez en sesiones de diagnóstico
+  ad-hoc. WAL permite lectores concurrentes sin bloquear al escritor (y
+  viceversa), que es exactamente el patrón de este dashboard (lee cada 15
+  min mientras el bot escribe constantemente). `busy_timeout` queda como red
+  de seguridad adicional. Aplica a todo el proyecto desde ahora, no sólo al
+  dashboard.
+- **P&L no realizado es una aproximación, no mark-to-market real**: para
+  posiciones abiertas/pendientes, el dashboard suma `net_pnl` (el valor
+  calculado al momento del fill en Fase 2 parte 1) en vez de re-consultar el
+  order book actual y recalcular con precios en vivo — el job del dashboard
+  no tiene acceso al `OrderBookStore` en memoria del proceso principal (son
+  procesos separados) y volver a pedir el book completo por HTTP para cada
+  posición abierta habría sido una ampliación de scope no pedida. El
+  dashboard lo aclara explícitamente en la propia página, no lo esconde.
+- **Hit rate esperado ~100% para arb — no es un bug si lo es**: se documenta
+  en el propio dashboard para que no se lea como "no hay nada interesante
+  que ver": el arb paga $1/share sin importar el resultado, así que un hit
+  rate bajo señalaría un error real en sizing/fees, no mala suerte.
+- **Brier score reutiliza `longshot_brier_report` de la parte 2 tal cual**,
+  con la misma cobertura parcial ya documentada (sólo mercados que también
+  tuvieron una posición de arb resuelta) — el dashboard lo aclara en texto
+  junto al gráfico, no sólo en CLAUDE.md, para que quien lo mire sin
+  contexto previo no lo malinterprete como Brier completo de longshot.
+- **Todas las consultas del snapshot son agregados SQL** (`COUNT`/`SUM`/
+  `AVG`/`GROUP BY` con `LIMIT` en listados), nunca `.all()` sobre las tablas
+  completas — mismo cuidado que en los chequeos de salud anteriores. La
+  curva de equity sólo itera sobre posiciones *cerradas* (un set acotado por
+  construcción, no toda la tabla).
+- **Variable nueva en `.env`**: `DASHBOARD_OUTPUT_PATH` (default
+  `data/dashboard.html`).
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 

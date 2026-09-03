@@ -145,6 +145,34 @@ git pull
 sudo systemctl restart polymarket-bot.service
 ```
 
+## Dashboard (Fase 2, parte 3)
+
+Reporte HTML estático (`data/dashboard.html`), regenerado cada 15 minutos por
+un systemd timer — **no** es un servidor vivo (ver CLAUDE.md para por qué se
+descartó Streamlit/Dash en esta instancia). Definidos en
+[`deploy/polymarket-bot-dashboard.service`](../deploy/polymarket-bot-dashboard.service)
+y [`deploy/polymarket-bot-dashboard.timer`](../deploy/polymarket-bot-dashboard.timer):
+
+```bash
+sudo cp deploy/polymarket-bot-dashboard.service deploy/polymarket-bot-dashboard.timer /etc/systemd/system/
+sudo restorecon -v /etc/systemd/system/polymarket-bot-dashboard.*  # misma trampa SELinux que el service principal
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-bot-dashboard.timer
+
+# Generar una corrida manual (sin esperar al timer)
+sudo systemctl start polymarket-bot-dashboard.service
+
+# Ver cuándo corrió / próxima corrida
+systemctl list-timers polymarket-bot-dashboard.timer
+
+# Logs de la última generación
+sudo journalctl -u polymarket-bot-dashboard.service -n 20 --no-pager
+```
+
+Para verlo: `scp` el archivo (`scp -i clave.key opc@IP:/opt/polymarket-bot/data/dashboard.html .`
+y abrirlo local), o pedirle a Claude Code que lo traiga y lo publique como
+Artifact en el chat del proyecto.
+
 ## Revisar datos acumulados
 
 La base SQLite vive en `/opt/polymarket-bot/data/polybot.db`. Para
