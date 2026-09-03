@@ -31,6 +31,7 @@ class Opportunity(Base):
     net_spread: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Sesgo favorito-longshot
+    outcome: Mapped[str | None] = mapped_column(String, nullable=True)  # "YES" | "NO" -- a qué outcome refieren outcome_price/corrected_price
     outcome_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     corrected_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     trade_direction: Mapped[str | None] = mapped_column(String, nullable=True)  # "YES" | "NO"
@@ -73,5 +74,28 @@ class SimulatedPosition(Base):
     slippage_estimate: Mapped[float] = mapped_column(Float)
     net_pnl: Mapped[float] = mapped_column(Float)
     realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    resolved_outcome: Mapped[str | None] = mapped_column(String, nullable=True)  # "YES" | "NO"
+    resolved_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     book_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class SignalResolution(Base):
+    """Resolución real de un mercado que tuvo al menos una señal favorito-longshot
+    (`Opportunity.signal_type == "longshot_bias"`), para calcular Brier score
+    (ver `signals/brier.py`).
+
+    Se completa de forma oportunista: el job de resolución (Fase 2, parte 2) sólo
+    consulta activamente los mercados con posiciones de arb abiertas/pendientes;
+    cuando resuelve uno de esos mercados, aprovecha la misma consulta para
+    completar esta tabla si ese mercado también tuvo señales longshot. Cobertura
+    parcial por diseño — no representa la población completa de mercados con
+    señal longshot. Ver CLAUDE.md, sección "Fase 2, parte 2" para la justificación.
+    """
+
+    __tablename__ = "signal_resolutions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    market_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    resolved_outcome: Mapped[str] = mapped_column(String)  # "YES" | "NO"
+    resolved_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))

@@ -55,5 +55,9 @@ class Settings:
     arb_max_exposure_per_cluster: float = _float_env("ARB_MAX_EXPOSURE_PER_CLUSTER", 0.20)
     kelly_fraction: float = _float_env("KELLY_FRACTION", 0.25)
 
+    # Fase 2: tracking de resolución real + Brier score
+    resolution_check_interval_seconds: int = _int_env("RESOLUTION_CHECK_INTERVAL_SECONDS", 900)
+    resolution_stale_after_days: int = _int_env("RESOLUTION_STALE_AFTER_DAYS", 7)
+
 
 settings = Settings()

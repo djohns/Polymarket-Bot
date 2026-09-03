@@ -45,8 +45,9 @@ matan el margen, y cualquier cosa que dependa de velocidad sub-segundo.
     sizing ("fórmula de ganancia garantizada" para arb, Kelly fraccionado ¼
     como primitiva lista para señales futuras de edge incierto). Ver sección
     dedicada más abajo.
-  - **Parte 2 (pendiente)**: tracking de resolución real de mercados y Brier
-    score.
+  - **Parte 2 (hecha)**: tracking de resolución real de mercados (cierre de
+    posiciones de arb con P&L realizado) y Brier score (sólo aplica a
+    longshot, no a arb — ver sección dedicada más abajo).
   - **Parte 3 (pendiente)**: dashboard.
 - **Fase 3**: vivo con capital mínimo (decenas–cientos de USDC). Ejecución
   real firmada, kill-switch, wallet con private key cifrada en reposo.
@@ -67,13 +68,16 @@ src/polybot/
     fees.py       # Estimación de fee taker desde feeSchedule por mercado (Fase 1)
     arbitrage.py  # Detección arb intra-mercado v1 (Fase 1)
     longshot.py   # Detección sesgo favorito-longshot v2 (Fase 1, sólo señal informativa)
+    brier.py      # Brier score de calibración — sólo longshot, no arb (Fase 2, parte 2)
   risk/
     kelly.py    # Kelly fraccionado (¼) — primitiva reusable, NO usada por el arb (Fase 2)
     sizing.py   # Tope de capital para arb: "fórmula de ganancia garantizada" (Fase 2)
   execution/
-    simulator.py  # Simulador de fills de arb contra el order book real, sin firmar (Fase 2)
+    simulator.py       # Simulador de fills de arb contra el order book real, sin firmar (Fase 2)
+    resolution.py       # Consulta de resolución real vía CLOB (Fase 2, parte 2)
+    resolution_job.py    # Cierra posiciones resueltas + backfill de Brier (Fase 2, parte 2)
   persistence/
-    models.py   # Opportunity (señales Fase 1) + SimulatedPosition (fills simulados, Fase 2)
+    models.py   # Opportunity + SimulatedPosition (Fase 2 p.1) + SignalResolution (Fase 2 p.2)
     db.py       # Engine/session SQLite
   dashboard/    # Streamlit/Dash: posiciones, P&L, Brier score (Fase 2, parte 3)
   config.py     # Settings desde .env, URLs de APIs, umbrales de señales
@@ -245,6 +249,120 @@ tests/
   `ARB_CAPITAL_BASE` (1000.0), `ARB_MAX_FRACTION_PER_TRADE` (0.05),
   `ARB_MAX_EXPOSURE_PER_MARKET` (0.10), `ARB_MAX_EXPOSURE_PER_CLUSTER` (0.20),
   `KELLY_FRACTION` (0.25, sin uso activo por ahora).
+
+## Fase 2, parte 2 — resolución real de mercados + Brier score
+
+- **Cómo se determina "resuelto"**: vía CLOB, `GET /markets/{condition_id}`
+  (no Gamma). Gamma `/markets` **no filtra por `condition_id`/`conditionId`**
+  — el parámetro se ignora en silencio y devuelve el listado paginado sin
+  filtrar (verificado empíricamente); sólo permite buscar un mercado puntual
+  por su `id` numérico interno, que este proyecto no guarda en ningún lado.
+  CLOB en cambio expone `GET /markets/{condition_id}` directo, con `closed`
+  (bool) y, por cada token de outcome, un flag `winner` (bool) — mucho más
+  directo que parsear `outcomePrices` de Gamma (que en mercados legacy
+  pre-2026 ni siquiera trae `umaResolutionStatus` poblado). Un mercado se
+  considera resuelto cuando `closed=True` y **exactamente un** token tiene
+  `winner=True`; el nombre de ese token (`"Yes"`/`"No"`, verificado contra un
+  mercado real ya resuelto) es el outcome ganador. Si está `closed=True` pero
+  ningún token (o más de uno) tiene `winner=True`, se trata como no resuelto
+  todavía — oráculo o disputa en curso.
+- **Frecuencia del job**: `RESOLUTION_CHECK_INTERVAL_SECONDS` (default 900s /
+  15min). Los mercados tardan horas a días en resolver (propuesta UMA +
+  ventana de disputa ~2h, o 4-6 días si escala al DVM — ver informe técnico),
+  así que no hace falta pollear más seguido; se prioriza no gastar cuota de
+  API ni ciclos de CPU en un proceso ya ajustado de RAM.
+- **No bloquea el loop de ingesta/detección**: el job corre en el mismo
+  event loop (mismo proceso, `asyncio.create_task` separado del loop de
+  descubrimiento/WS), pero `execution/resolution.py` usa
+  `httpx.AsyncClient` (no `httpx.Client` síncrono) — cada `await` cede el
+  control, así que una consulta HTTP lenta no traba el heartbeat/reconexión
+  del WebSocket como pasaría con una llamada bloqueante en el mismo hilo.
+- **Scope del job**: sólo consulta mercados con `SimulatedPosition.status in
+  ("abierta", "pendiente")` — un set chico, acotado por los límites de
+  exposición de `risk/sizing.py` (parte 1), no toda la población de mercados
+  vistos por Fase 1.
+- **P&L realizado**: para arb "long", el payout es $1/share sin importar el
+  outcome, así que `realized_pnl` se recalcula independientemente
+  (`shares − cost_usd − fee_estimate`) en vez de copiar `net_pnl` del fill, y
+  se compara contra ese `net_pnl` como chequeo de consistencia (debería
+  coincidir siempre salvo bug; si difiere se loguea un WARNING). `status`
+  pasa a `"cerrada"` y se guarda `resolved_outcome` + `resolved_at`.
+- **Caso borde — no resuelve a tiempo / posible disputa**: si un mercado
+  queda `closed=True` sin ganador único por más de `RESOLUTION_STALE_AFTER_DAYS`
+  (default 7, con margen sobre los 4-6 días típicos de escalada al DVM de UMA
+  citados en el informe) desde que se abrió la posición, se marca
+  `status="pendiente"` y se loguea un WARNING una sola vez por posición (set
+  en memoria, se resetea si el proceso reinicia — aceptable dado el volumen
+  bajo). El job sigue reintentando esa posición indefinidamente, nunca la
+  descarta. No se distingue "disputa activa" de "oráculo simplemente lento"
+  porque CLOB no expone esa granularidad — es la limitación aceptada de usar
+  la fuente más simple y confiable disponible en vez de cruzar con Gamma
+  (que tampoco permite un lookup puntual, ver arriba).
+- **Caso borde — mercado no encontrado (404) o error de red**: se loguea un
+  WARNING y se reintenta en el próximo ciclo; nunca rompe el job ni el
+  proceso completo (`resolution_loop` además envuelve todo el ciclo en
+  try/except).
+- **Límite reconocido, no resuelto en esta parte**: `closed=True` +
+  `winner=True` en CLOB refleja que el oráculo UMA asentó el resultado (pasó
+  la ventana de disputa), pero no hay verificación on-chain propia de que la
+  redención efectivamente ocurrió sin reversión — el informe cita el paper
+  "The Ghosts of Polymarket" (arXiv:2606.16852) sobre fills que revierten
+  on-chain. Confirmar eso requeriría un listener de eventos on-chain
+  (Fase 3+, capa de ejecución real); por ahora se confía en el estado que
+  Polymarket expone como su propia fuente de verdad.
+- **Brier score — lectura pedida explícitamente sobre si aplica a arb puro**:
+  **NO aplica.** El arb "long" no tiene una predicción direccional: comprar
+  YES+NO<$1 paga $1 al vencimiento sin importar qué outcome gane — es
+  deliberadamente agnóstico sobre el resultado (por eso es "riskless" en
+  concepto). No existe una "probabilidad implícita" que comparar contra el
+  resultado real; forzar un Brier score ahí sería puntuar una predicción que
+  nunca se hizo. La señal que sí produce una probabilidad implícita real es
+  el sesgo favorito-longshot (`Opportunity.corrected_price`, con
+  `Opportunity.outcome` — columna nueva esta parte — indicando a qué lado
+  refiere). El Brier score se implementa sobre esa señal (`signals/brier.py`).
+- **Cobertura del Brier de longshot es parcial por diseño, no completa**: el
+  job de resolución sólo consulta activamente mercados con posiciones de
+  arb — resolver también los ~350+ mercados (y creciendo) que sólo tuvieron
+  señal longshot habría sido una ampliación de scope bastante más grande
+  (varias veces más llamadas a CLOB por ciclo) que lo que se pidió
+  explícitamente ("mercados que tienen posiciones simuladas abiertas o
+  pendientes"). En cambio, cuando el job resuelve un mercado por su posición
+  de arb, aprovecha esa misma consulta (ya pagada) para completar
+  `SignalResolution` si ese mercado también tuvo señales longshot — a costo
+  cero de API extra. Esto da cobertura real pero sesgada (sólo mercados que
+  también tuvieron arb, no una muestra representativa de todo el longshot).
+  Si se necesita calibración representativa de longshot antes de que se
+  vuelva una señal ejecutable, ampliar la resolución a la población completa
+  de mercados longshot es un trabajo aparte para una fase futura.
+- **No hay tabla de Brier "acumulado"**: `signals/brier.py` calcula el score
+  al vuelo (agrupado por día o semana, `brier_score_by_window`) a partir de
+  `opportunities` × `signal_resolutions`, en vez de mantener una tabla
+  derivada recalculada por otro job. Al volumen de datos actual (cobertura
+  parcial, probablemente decenas de muestras por bastante tiempo) recalcular
+  on-demand es barato y evita mantener un agregado que se puede desincronizar;
+  se puede añadir una tabla persistida más adelante si el dashboard (parte 3)
+  necesita servir gráficos históricos sobre mucho volumen. `scripts/brier_report.py`
+  expone el reporte hoy sin esperar al dashboard.
+- **Nueva columna `Opportunity.outcome`** ("YES"/"NO", sólo longshot): antes
+  de esta parte, `outcome_price`/`corrected_price` no registraban a qué lado
+  del mercado referían — hacía imposible saber si la "probabilidad predicha"
+  correspondía a YES o a NO al cruzar contra el resultado real. Se completa
+  desde `LongshotSignal.outcome`, que ya existía en el motor de señales
+  (`signals/longshot.py`) pero no se persistía.
+- **Bug de SQLite + SQLAlchemy encontrado y corregido**: `DateTime(timezone=True)`
+  no hace round-trip del `tzinfo` en SQLite — un valor se guarda en UTC
+  correctamente, pero al releerse después de que la sesión expira el objeto
+  vuelve *naive* (sin tzinfo), aunque el dato en sí siga siendo UTC. Rompía
+  la resta `now - pos.opened_at` en el chequeo de staleness
+  (`TypeError: can't subtract offset-naive and offset-aware datetimes`).
+  Fix: en `execution/resolution_job.py`, si `opened_at.tzinfo is None` se
+  reetiqueta como UTC (`.replace(tzinfo=dt.UTC)`) antes de operar — no es una
+  conversión real de huso horario, sólo reponer la etiqueta que SQLite perdió.
+  Vale la pena tenerlo presente para cualquier código futuro que haga
+  aritmética de fechas sobre columnas `DateTime(timezone=True)` releídas de
+  este SQLite.
+- **Variables nuevas en `.env`**: `RESOLUTION_CHECK_INTERVAL_SECONDS` (900),
+  `RESOLUTION_STALE_AFTER_DAYS` (7).
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 

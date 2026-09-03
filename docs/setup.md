@@ -35,6 +35,8 @@ lectura pública de Gamma/CLOB, sin autenticación de trading.
 | `ARB_MAX_EXPOSURE_PER_MARKET` | Exposición abierta máxima (fracción) por mercado | No (default 0.10) |
 | `ARB_MAX_EXPOSURE_PER_CLUSTER` | Exposición abierta máxima (fracción) por cluster de eventos | No (default 0.20) |
 | `KELLY_FRACTION` | Fracción de Kelly para señales de edge incierto (sin uso activo hoy) | No (default 0.25) |
+| `RESOLUTION_CHECK_INTERVAL_SECONDS` | Frecuencia del job de resolución de mercados (Fase 2) | No (default 900) |
+| `RESOLUTION_STALE_AFTER_DAYS` | Días sin resolver antes de marcar una posición "pendiente" (posible disputa) | No (default 7) |
 
 ## Probar la conexión de solo lectura
 

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import time
 
 from sqlalchemy import func, select
 
 from polybot.config import settings
+from polybot.execution.resolution_job import resolve_open_positions
 from polybot.execution.simulator import simulate_arbitrage_fill
 from polybot.ingestion.gamma_discovery import MarketInfo, fetch_active_markets
 from polybot.ingestion.orderbook import OrderBookStore
@@ -150,6 +152,7 @@ class SignalEngine:
                         market_id=market.condition_id,
                         question=market.question,
                         signal_type="longshot_bias",
+                        outcome=sig.outcome,
                         outcome_price=sig.outcome_price,
                         corrected_price=sig.corrected_price,
                         trade_direction=sig.trade_direction,
@@ -191,6 +194,26 @@ async def _run_ws_session(
     return asyncio.create_task(ws_client.run())
 
 
+async def resolution_loop() -> None:
+    """Job periódico e independiente del loop de ingesta/detección (Fase 2, parte 2):
+    consulta la resolución real de los mercados con posiciones de arb abiertas o
+    pendientes, cierra las que ya resolvieron con su P&L realizado, y aprovecha esa
+    misma consulta para alimentar Brier score si el mercado también tuvo señales
+    longshot. Corre en el mismo event loop que la ingesta WS, pero sin bloquearla:
+    la consulta HTTP es async (`httpx.AsyncClient`), así que cede el control en cada
+    `await` en vez de trabar el heartbeat/reconexión del WebSocket.
+    """
+    stale_after = dt.timedelta(days=settings.resolution_stale_after_days)
+    warned_stale: set[int] = set()
+    while True:
+        try:
+            with get_session() as session:
+                await resolve_open_positions(session, stale_after=stale_after, warned_stale=warned_stale)
+        except Exception:
+            logger.exception("Fallo en el ciclo de resolución de mercados, se reintenta en el próximo ciclo")
+        await asyncio.sleep(settings.resolution_check_interval_seconds)
+
+
 async def run() -> None:
     init_db()
     store = OrderBookStore()
@@ -203,6 +226,7 @@ async def run() -> None:
     logger.info("Arrancando ingesta, arb_threshold=%.3f", settings.arb_threshold)
     current_ids = {m.condition_id for m in markets}
     ws_task = await _run_ws_session(markets, store)
+    asyncio.create_task(resolution_loop())
 
     while True:
         await asyncio.sleep(settings.discovery_interval_seconds)
