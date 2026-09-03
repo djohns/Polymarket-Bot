@@ -169,9 +169,139 @@ systemctl list-timers polymarket-bot-dashboard.timer
 sudo journalctl -u polymarket-bot-dashboard.service -n 20 --no-pager
 ```
 
-Para verlo: `scp` el archivo (`scp -i clave.key opc@IP:/opt/polymarket-bot/data/dashboard.html .`
-y abrirlo local), o pedirle a Claude Code que lo traiga y lo publique como
-Artifact en el chat del proyecto.
+Para verlo sin exponerlo a internet: `scp` el archivo
+(`scp -i clave.key opc@IP:/opt/polymarket-bot/data/dashboard.html .` y abrirlo
+local), o pedirle a Claude Code que lo traiga y lo publique como Artifact en
+el chat del proyecto. Para verlo en tiempo real sin SCP manual, ver la
+siguiente sección.
+
+## Dashboard vía web (Fase 2, parte 4) — nginx
+
+**URL**: `http://<IP_PUBLICA>:8090/dashboard.html` (HTTP simple, no HTTPS —
+ver justificación de seguridad abajo). Usuario `polybot`, contraseña
+generada al momento del setup (no versionada en el repo — pedirla a quien
+hizo el deploy, o regenerarla con el comando de abajo).
+
+**Decisiones de seguridad** (contenido no sensible — paper trading, sin
+private key ni credenciales de trading — pero es un servicio nuevo expuesto
+a internet, así que igual se aplicó protección básica):
+- **Puerto no estándar** (8090, no 80/443) — reduce ruido de escaneo masivo
+  automatizado de los puertos por defecto, aunque no es una barrera real.
+- **HTTP Basic Auth** (`auth_basic` + `.htpasswd`) — la protección real. Nota
+  honesta: es HTTP plano, no HTTPS, así que el usuario/contraseña viajan sin
+  cifrar en la red — aceptable acá porque el contenido no es sensible y el
+  objetivo es sólo evitar acceso casual/scanners, no un adversario activo en
+  la red. No se justificó el costo de operar TLS (Let's Encrypt necesita un
+  dominio; la instancia sólo tiene IP pública) para este nivel de riesgo.
+- **Nada del filesystem expuesto salvo ese archivo exacto**: la config de
+  nginx no tiene `root` de directorio — usa `alias` apuntando al único
+  archivo `dashboard.html`, y cualquier otro path devuelve 404. La base
+  SQLite (`polybot.db`) vive en el mismo directorio pero nunca es alcanzable
+  por HTTP.
+- **Puerto 80 completamente deshabilitado**: se quitó el server block por
+  defecto de `nginx.conf` en vez de dejarlo con la página de bienvenida sin
+  protección.
+
+**Instalación** (paquete `nginx` vía `dnf`, mismo cuidado de memoria que el
+resto de la instalación — repos reducidos + `swappiness=100`, ver arriba):
+
+```bash
+sudo sysctl -w vm.swappiness=100
+sudo dnf install -y --disablerepo=ol9_ksplice --disablerepo=ol9_UEKR8 \
+  --disablerepo=ol9_oci_included --disablerepo=ol9_addons \
+  --setopt=install_weak_deps=False --setopt=tsflags=nodocs nginx
+
+# Basic auth: generar contraseña + hash APR1 (sin instalar httpd-tools)
+PASS=$(openssl rand -base64 18 | tr -d '=+/' | head -c 20)
+HASH=$(openssl passwd -apr1 "$PASS")
+echo "polybot:$HASH" | sudo tee /etc/nginx/.htpasswd >/dev/null
+sudo chmod 640 /etc/nginx/.htpasswd && sudo chown root:nginx /etc/nginx/.htpasswd
+echo "Contraseña generada (guardarla, no queda en ningún archivo del repo): $PASS"
+
+# Config: deploy/nginx.conf reemplaza /etc/nginx/nginx.conf completo (quita el
+# server block del puerto 80); deploy/nginx-dashboard.conf va en conf.d/.
+sudo cp deploy/nginx.conf /etc/nginx/nginx.conf
+sudo cp deploy/nginx-dashboard.conf /etc/nginx/conf.d/dashboard.conf
+sudo restorecon -Rv /etc/nginx/nginx.conf /etc/nginx/conf.d/dashboard.conf /etc/nginx/.htpasswd
+```
+
+**SELinux** (Enforcing en esta instancia — dos ajustes no obvios, ninguno
+cubierto por `restorecon` porque no son de contexto de archivo sino de
+política):
+
+```bash
+# El puerto 8090 no está en la lista http_port_t por defecto (sólo 80, 81,
+# 443, 488, 8008, 8009, 8443, 9000) -- sin esto nginx falla el bind con
+# "Permission denied" aunque el firewall esté bien.
+sudo semanage port -a -t http_port_t -p tcp 8090
+
+# El archivo vive en /opt/polymarket-bot/data/, etiquetado usr_t (heredado del
+# resto del proyecto) -- httpd_t no puede leerlo hasta reetiquetarlo. Como
+# report.py reescribe el archivo in-place (mismo inodo, no lo recrea), esta
+# regla persiste entre regeneraciones y sólo hace falta aplicarla una vez.
+sudo semanage fcontext -a -t httpd_sys_content_t '/opt/polymarket-bot/data/dashboard.html'
+sudo restorecon -v /opt/polymarket-bot/data/dashboard.html
+```
+
+**Firewall local (firewalld) + arranque**:
+
+```bash
+sudo firewall-cmd --permanent --add-port=8090/tcp
+sudo firewall-cmd --reload
+sudo systemctl enable --now nginx
+```
+
+**Firewall de red de Oracle Cloud (Security List / NSG) — hay que hacerlo
+aparte, en la consola web, con la cuenta de OCI.** Oracle Cloud filtra a
+nivel de VCN *además* del firewall del SO — abrir sólo firewalld no alcanza,
+el tráfico externo nunca llega a la instancia si la Security List lo
+bloquea antes. Claude Code no tiene acceso a la consola de OCI (es un login
+de cuenta separado), así que este paso lo tiene que hacer el dueño de la
+cuenta:
+
+1. Consola OCI → **Networking → Virtual Cloud Networks** → la VCN de esta
+   instancia (subnet con CIDR `10.0.0.0/24`, región `sa-santiago-1` — o más
+   directo: **Compute → Instances → (esta instancia) → Instance details →
+   pestaña "Attached VNICs" → click en la VNIC → link a la subnet**).
+2. Entrar a la subnet → **Security Lists** → la lista asociada (normalmente
+   "Default Security List for `<nombre VCN>`").
+3. **Add Ingress Rules**:
+   - Source Type: `CIDR`, Source CIDR: `0.0.0.0/0` (o restringir a una IP/red
+     propia si se quiere acotar aún más — recomendado si se conoce una IP
+     fija desde donde se va a mirar).
+   - IP Protocol: `TCP`.
+   - Destination Port Range: `8090`.
+   - Description: algo como "Dashboard Polymarket Bot (Fase 2, HTTP+Basic Auth)".
+4. Guardar. Los cambios de Security List aplican casi al instante, sin
+   reiniciar nada en la instancia.
+
+**Validar** (desde la propia VPS primero, sin depender de que el Security
+List ya esté abierto):
+
+```bash
+curl -i http://localhost:8090/dashboard.html          # 401 sin credenciales
+curl -i -u polybot:<PASSWORD> http://localhost:8090/dashboard.html   # 200
+curl -i http://localhost:8090/polybot.db               # 404 -- nada más se expone
+```
+
+Y desde afuera, una vez abierta la Security List:
+
+```bash
+curl -i -u polybot:<PASSWORD> http://<IP_PUBLICA>:8090/dashboard.html
+```
+
+**Memoria**: nginx con esta config (1 worker, sin módulos extra) usa ~2MB de
+RSS — no compite de forma relevante con el bot (que sigue en 40-80MB) en los
+498MB totales de la instancia.
+
+**Operación**:
+
+```bash
+sudo systemctl status nginx
+sudo systemctl restart nginx
+sudo nginx -t                              # validar sintaxis antes de recargar
+sudo journalctl -u nginx -n 50 --no-pager
+```
 
 ## Revisar datos acumulados
 

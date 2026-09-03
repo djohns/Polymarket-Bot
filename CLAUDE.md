@@ -51,6 +51,9 @@ matan el margen, y cualquier cosa que dependa de velocidad sub-segundo.
   - **Parte 3 (hecha)**: dashboard — reporte HTML estático regenerado por
     systemd timer, no un server vivo (Streamlit descartado por RAM). Ver
     sección dedicada más abajo.
+  - **Parte 4 (hecha, fuera del plan original de 3 partes)**: exposición del
+    dashboard vía nginx en un puerto no estándar con HTTP Basic Auth, para
+    verlo sin SCP manual. Ver sección dedicada más abajo.
 - **Fase 3**: vivo con capital mínimo (decenas–cientos de USDC). Ejecución
   real firmada, kill-switch, wallet con private key cifrada en reposo.
 - **Fase 4**: escalado condicional (drawdown real ≤ 2× simulado).
@@ -442,6 +445,68 @@ tests/
   construcción, no toda la tabla).
 - **Variable nueva en `.env`**: `DASHBOARD_OUTPUT_PATH` (default
   `data/dashboard.html`).
+
+## Fase 2, parte 4 — dashboard vía web (nginx)
+
+Detalle completo de instalación en [docs/deploy.md](docs/deploy.md); resumen
+de las decisiones no obvias:
+
+- **nginx, no una alternativa más liviana**: el pedido ya proponía nginx "o
+  alternativa igual de liviana" — con 1 worker y sin módulos extra usa ~2MB
+  de RSS en esta instancia, un footprint tan chico que buscar algo "más
+  liviano todavía" no habría cambiado nada relevante en el presupuesto de
+  498MB. No se evaluaron alternativas.
+- **Seguridad elegida para esta fase — puerto no estándar (8090) + HTTP
+  Basic Auth, sin TLS**: el contenido no es sensible (paper trading, sin
+  private key ni credenciales), pero es un servicio nuevo expuesto a
+  internet, así que se aplicó protección real igual. Basic Auth es la
+  protección efectiva (puerto no estándar sólo reduce ruido de escaneo
+  automatizado, no es una barrera). No se implementó TLS: Let's Encrypt
+  necesita un dominio propio y la instancia sólo tiene IP pública — para el
+  nivel de riesgo de esta fase (nada sensible, uso personal), el costo de
+  operar certificados no se justificaba. Queda documentado como decisión
+  consciente, no como omisión: si el contenido cambia de naturaleza (datos
+  reales, credenciales) esto hay que revisarlo.
+- **Nada del filesystem expuesto salvo el archivo exacto**: la config nginx
+  no usa `root` de directorio, sólo `alias` al path completo de
+  `dashboard.html`; cualquier otro path devuelve 404. La base SQLite vive en
+  el mismo directorio y nunca es alcanzable por HTTP — verificado
+  explícitamente (`curl .../polybot.db` → 404).
+- **Puerto 80 deshabilitado por completo**, no dejado con la página de
+  bienvenida por defecto de nginx sin protección — se quitó el server block
+  correspondiente de `nginx.conf` en vez de sólo no abrirlo en el firewall,
+  para no depender únicamente de esa capa.
+- **Dos filtros de red distintos, hay que abrir ambos** (esto es
+  específico de Oracle Cloud, no aplica a un VPS genérico): firewalld en el
+  SO **y** la Security List/NSG de la VCN en la consola de OCI. Uno sin el
+  otro no sirve — si sólo se abre firewalld, el tráfico externo ni siquiera
+  llega a la instancia porque la VCN lo bloquea antes.
+- **La parte de la Security List de OCI no la puede hacer Claude Code**: es
+  un login de cuenta separado (consola web de Oracle Cloud), sin
+  credenciales ni acceso configurado en esta instancia (se confirmó que no
+  hay CLI `oci` instalado ni policy de instance principal). Esa parte
+  siempre requiere que el dueño de la cuenta entre a la consola — Claude
+  Code puede preparar todo lo demás (nginx, firewalld, SELinux) y dar los
+  pasos exactos, pero no ejecutar ese paso.
+- **Dos ajustes de SELinux no obvios** (Enforcing en esta instancia, ninguno
+  cubierto por `restorecon` porque son de política, no de contexto de
+  archivo):
+  - El puerto 8090 no está en la lista `http_port_t` por defecto (sólo 80,
+    81, 443, 488, 8008, 8009, 8443, 9000) — nginx fallaba el `bind()` con
+    "Permission denied" aunque firewalld ya estuviera bien. Fix:
+    `semanage port -a -t http_port_t -p tcp 8090`.
+  - El archivo `dashboard.html` hereda el contexto `usr_t` del resto del
+    proyecto en `/opt/polymarket-bot/data/` — `httpd_t` no puede leerlo
+    hasta reetiquetarlo a `httpd_sys_content_t`
+    (`semanage fcontext -a ...` + `restorecon`). Como `report.py` reescribe
+    el archivo in-place (mismo inodo, `open(path, "w")` no lo recrea), esta
+    regla persiste entre regeneraciones — se aplica una sola vez, no hay que
+    repetirla en cada corrida del timer.
+- **Contraseña de Basic Auth generada al momento del setup, no versionada**:
+  `openssl rand` + `openssl passwd -apr1` (evita instalar `httpd-tools` sólo
+  para tener `htpasswd`). Vive únicamente en `/etc/nginx/.htpasswd` en la
+  VPS (permisos 640, `root:nginx`) y se comunicó una vez por chat a quien
+  hizo el deploy — no está en el repo ni en `.env`.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
