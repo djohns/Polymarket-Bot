@@ -99,7 +99,13 @@ class RealPosition(Base):
     market_id: Mapped[str] = mapped_column(String, index=True)
     cluster_id: Mapped[str] = mapped_column(String, index=True)
     question: Mapped[str] = mapped_column(String)
-    status: Mapped[str] = mapped_column(String, default="abierta", index=True)  # "abierta" | "cerrada" | "pendiente"
+    # "enviada" (orden YES recién enviada, resultado todavía no confirmado -- ver
+    # incidente del 2026-09-08, sección Fase 3 de CLAUDE.md: antes de este estado
+    # una orden real podía llenar de verdad y no quedar registrada en ningún lado
+    # si la señal de "llenó" fallaba) | "cancelada" (YES confirmado sin llenar,
+    # nada de capital tocado) | "abierta" | "cerrada" | "pendiente" (leg imbalance
+    # o fallo de envío sin poder confirmar el resultado -- requiere revisión manual)
+    status: Mapped[str] = mapped_column(String, default="enviada", index=True)
 
     shares: Mapped[float] = mapped_column(Float)
     yes_price_avg: Mapped[float] = mapped_column(Float)
@@ -115,6 +121,31 @@ class RealPosition(Base):
     no_order_id: Mapped[str | None] = mapped_column(String, nullable=True)
     yes_tx_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     no_tx_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    notes: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class RealExecutionEvent(Base):
+    """Bitácora persistida (no sólo journald) de eventos críticos de ejecución
+    real -- envío de orden, confirmación de fill, leg imbalance, kill-switch,
+    divergencia de reconciliación. Agregada tras el incidente del 2026-09-08:
+    journald en la VPS retiene apenas ~8.8MB y rotó por completo el período del
+    incidente en horas, dejando el diagnóstico ciego justo cuando más hacía
+    falta. Esta tabla es la fuente de verdad durable para esos eventos -- ver
+    CLAUDE.md, sección Fase 3, "logging resiliente".
+    """
+
+    __tablename__ = "real_execution_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    occurred_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), index=True
+    )
+    event_type: Mapped[str] = mapped_column(String, index=True)
+    severity: Mapped[str] = mapped_column(String, default="info", index=True)  # "info" | "warning" | "critical"
+    message: Mapped[str] = mapped_column(String)
+    market_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    real_position_id: Mapped[int | None] = mapped_column(nullable=True, index=True)
+    detail: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class SignalResolution(Base):

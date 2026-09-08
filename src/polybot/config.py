@@ -72,6 +72,10 @@ class Settings:
     real_encrypted_key_path: str = os.getenv("REAL_ENCRYPTED_KEY_PATH", "data/private_key.enc")
     real_key_passphrase_env_var: str = os.getenv("REAL_KEY_PASSPHRASE_ENV_VAR", "POLYMARKET_KEY_PASSPHRASE")
     real_balance_check_interval_seconds: int = _int_env("REAL_BALANCE_CHECK_INTERVAL_SECONDS", 300)
+    # Divergencia máxima tolerada (USD) entre el balance real y lo que
+    # `real_positions` implica que debería haber, antes de considerarlo una
+    # señal de que algo quedó sin registrar (ver incidente del 2026-09-08).
+    real_reconciliation_threshold_usd: float = _float_env("REAL_RECONCILIATION_THRESHOLD_USD", 0.50)
     # Proxy wallet ("Safe Wallet") que Polymarket asigna a cuentas conectadas con wallet
     # externa (MetaMask/Rabby) -- ahí vive el pUSD real, no en la EOA firmante. Sin
     # default: es específico de cada cuenta, no tiene un valor razonable genérico.

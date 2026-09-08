@@ -740,6 +740,144 @@ de las decisiones no obvias:
   `REAL_FUNDER_ADDRESS` (sin default, específica de la cuenta),
   `REAL_SIGNATURE_TYPE` (3 = `POLY_1271`, verificado empíricamente, ver arriba).
 
+## Incidente del 2026-09-08 y correcciones (Fase 3)
+
+Primera activación real (`REAL_TRADING_ENABLED=true` el 2026-09-08 ~01:49
+UTC). Una auditoría manual el mismo día encontró que el bot había ejecutado
+capital real sin dejar ningún rastro en `real_positions`. Post-mortem
+completo, causa raíz, y las 4 correcciones estructurales aplicadas antes de
+considerar una segunda activación.
+
+**Qué pasó**: entre las 11:43 y las 18:07 el bot detectó y ejecutó 4 arbs
+reales en mercados deportivos elegibles (FC Seoul, Club Brugge KV, Aston
+Villa FC, AEK). En los 4 casos la orden YES llenó de verdad on-chain (capital
+real gastado, $10.876 en total), pero `_order_filled()` (la función que
+decidía si la orden había llenado) sólo miraba el campo `transactionsHashes`
+de la respuesta de `post_order` -- y ese campo se resuelve "best-effort"
+(documentado en el propio docstring del SDK: *"si el hash no está disponible
+todavía, el fill se puede seguir vía `tradeIDs`"*) y llegó vacío en los 4
+casos aunque el fill sí había ocurrido. El código concluyó "no llenó",
+abandonó sin comprar la pata NO, y -- porque el registro en `real_positions`
+sólo se escribía al final del flujo completo, no al enviar la orden -- no
+quedó ningún rastro en la base. El balance real cayó a $11.46 (bajo el piso
+de $15), el kill-switch automático se activó correctamente por drawdown a
+las 18:10:08 y detuvo todo trading real -- ese mecanismo sí funcionó como
+estaba diseñado. Se descubrió recién reconstruyendo los movimientos on-chain
+de la proxy wallet a mano (eventos `Transfer` de pUSD, cruzados contra los
+`opportunities`/`simulated_positions` ya logueados en los mismos instantes).
+2 de las 4 posiciones resolvieron YES (ganancia) y 2 NO (pérdida) -- el
+resultado neto terminó siendo positivo por suerte (2 de 4 ganaron), no
+porque el arb haya funcionado como estaba diseñado: fueron apuestas
+direccionales reales sin cobertura, no arbitraje.
+
+### 1. Detección de fill ya no confía en un único campo
+
+`execution/real_executor.py::_is_order_filled` reemplaza a la vieja
+`_order_filled`. Señales, de más a menos directa:
+1. **`transactionsHashes` o `tradeIDs`** en la respuesta inicial de
+   `post_order`/`create_and_post_market_order` (`_order_matched`) -- ambas
+   son evidencia de que la orden matcheó; `tradeIDs` es justo la señal que el
+   bug anterior ignoraba.
+2. Si ninguna de las dos aparece pero sí hay un `orderID`, se hace una
+   **consulta explícita de estado** (`_confirm_via_order_status`, vía
+   `client.get_order(order_id)`), buscando `size_matched`/`sizeMatched` > 0 o
+   un `status` reconocible (`MATCHED`/`FILLED` vs. `UNMATCHED`/`LIVE`/
+   `CANCELED`). La forma exacta de esta respuesta no se pudo confirmar contra
+   la API real en esta sesión (no había una orden real en vuelo para
+   inspeccionar) -- queda pendiente de validar/ajustar durante el próximo
+   setup supervisado, igual que ya se documentó para `_order_filled` original.
+3. **Si esa consulta es inconclusa** (la llamada falla, o la respuesta no
+   trae ninguna señal reconocible), se asume **LLENADA, no al revés**. Esta
+   es la corrección central: la lección del incidente fue exactamente el
+   error opuesto -- tratar una ambigüedad como "no llenó" dejó una orden real
+   con capital gastado sin registrar en ningún lado. Sin `orderID` en
+   absoluto (nunca se registró ni un intento de orden) sí se concluye con
+   confianza que no llenó -- ahí no hay ambigüedad que resolver a favor de la
+   cautela.
+
+Cubierto en `tests/test_execution_real_executor.py`:
+`test_tradeids_without_hashes_is_treated_as_filled` reproduce exactamente el
+bug (tradeIDs sin hashes) y confirma que ahora sigue con la pata NO;
+`test_ambiguous_order_status_defaults_to_filled_not_abandoned` cubre el caso
+totalmente inconcluso; `test_confirmed_not_filled_via_get_order_is_cancelled_not_abandoned`
+confirma que un "no matcheó" genuino sigue dejando registro (status
+"cancelada") en vez de desaparecer sin rastro.
+
+### 2. Registro inmediato al enviar, no al confirmar
+
+Cada intento de orden real ahora crea (o actualiza) una fila de
+`real_positions` **antes** de llamar a `create_and_post_market_order`, con
+`status="enviada"`, usando los valores estimados del fill (shares, precios,
+costo) como mejor aproximación disponible en ese momento. Esa misma fila se
+actualiza según lo que pase después: `"cancelada"` (YES confirmado sin
+llenar, nada de capital tocado), `"pendiente"` (falla de envío sin poder
+confirmar el resultado, o leg imbalance -- requiere revisión manual) o
+`"abierta"` (ambas patas confirmadas). El objetivo explícito es que una orden
+real nunca vuelva a quedar invisible, sea cual sea la ambigüedad de la
+respuesta del exchange -- ni siquiera si la llamada de red explota a mitad de
+camino (`test_position_is_persisted_immediately_before_fill_is_known`).
+
+`RealPosition.status` ahora tiene 5 valores posibles (antes 3): `"enviada"`
+(default), `"cancelada"`, `"abierta"`, `"cerrada"`, `"pendiente"`. Se agregó
+también `RealPosition.notes` (texto libre) para dejar contexto legible sobre
+qué pasó en los casos ambiguos o reconstruidos a mano.
+
+### 3. Logging resiliente -- persistido en la DB, no sólo journald
+
+journald en la VPS retiene apenas ~8.8MB y rotó por completo las ~19h que
+cubrían el incidente antes de que se pudiera auditar -- ni siquiera el
+mensaje `FASE 3 ACTIVA` del arranque sobrevivió. Nueva tabla
+`real_execution_events` (`persistence/models.py::RealExecutionEvent`):
+`event_type`, `severity` ("info"/"warning"/"critical"), `message`,
+`market_id`, `real_position_id`, `detail` (JSON). Único punto de entrada:
+`execution/event_log.py::log_event(session, event_type, severity, message,
+...)` -- siempre hace las dos cosas, loguea vía el logger de Python de
+siempre (journald sigue sirviendo para tail en vivo) y persiste la fila.
+`kill_switch.halt()` ahora acepta un `session` opcional y persiste el evento
+`kill_switch_triggered` cuando se le pasa uno (retrocompatible: sin
+`session`, se comporta exactamente igual que antes -- sólo flag + logger).
+Cubierto en `tests/test_execution_real_executor.py::test_execution_events_are_persisted_to_db`
+y `tests/test_execution_kill_switch.py::test_halt_with_session_persists_event`.
+
+### 4. Reconciliación automática de balance
+
+`execution/reconciliation.py`, corre dentro del mismo loop que ya consultaba
+el balance real cada `REAL_BALANCE_CHECK_INTERVAL_SECONDS` (300s,
+`main.py::real_balance_kill_switch_loop` -- se le agregó esto en vez de crear
+un loop nuevo, reusando la misma llamada HTTP ya pagada).
+`expected_balance_usd(session)` = `REAL_CAPITAL_BASE_USD` menos el `cost_usd`
+de toda posición en `"enviada"`/`"abierta"`/`"pendiente"` (capital que salió
+de la wallet y no hay certeza de que haya vuelto) más el `realized_pnl` de
+las posiciones `"cerrada"`. Si el balance real diverge de eso por más de
+`REAL_RECONCILIATION_THRESHOLD_USD` (default $0.50, para tolerar
+fees/redondeo), se loguea CRITICAL (persistido, evento
+`reconciliation_divergence`) y se activa el kill-switch preventivamente --
+exactamente la señal que faltó para detectar el incidente del 2026-09-08 sin
+depender de una auditoría manual. No distingue automáticamente "algo quedó
+sin registrar" de "hubo actividad manual en la cuenta fuera del bot" (ambas
+producen la misma divergencia) -- en cualquier caso, detener el trading real
+hasta que alguien lo entienda es el comportamiento correcto.
+
+### Backfill retroactivo
+
+Las 4 posiciones del incidente se registraron a mano en `real_positions`
+(`scripts/backfill_incident_2026_09_08.py`, ya ejecutado en la VPS, se deja
+en el repo como referencia/auditoría, no pensado para volver a correrse).
+`cost_usd` es exacto (tomado directo de los eventos `Transfer` de pUSD
+on-chain); `shares`/`yes_price_avg` son estimados a partir del
+`simulated_position` más cercano en el tiempo para el mismo mercado (mismo
+book, mismo precio observado), no un valor confirmado por el exchange -- cada
+fila lo deja explícito en `notes`.
+
+### Pendiente para la próxima activación
+
+- Validar el formato real de la respuesta de `client.get_order()` contra un
+  caso real (punto 1 arriba) durante el próximo setup supervisado.
+- Repetir el checklist de verificación pre-go-live completo (los mismos 7
+  puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
+  `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
+  explícita del usuario.
+
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
 Detalles completos en [docs/deploy.md](docs/deploy.md); resumen de lo no obvio:

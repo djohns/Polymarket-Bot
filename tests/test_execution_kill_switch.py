@@ -1,5 +1,14 @@
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 
 from polybot.execution import kill_switch
+from polybot.persistence.models import Base, RealExecutionEvent
+
+
+def _session_factory():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def test_is_halted_false_when_no_flag(tmp_path):
@@ -33,6 +42,34 @@ def test_check_balance_kill_switch_triggers_below_floor(tmp_path):
         assert flag.exists()
     finally:
         object.__setattr__(settings, "real_kill_switch_balance_floor_usd", old)
+
+
+def test_halt_with_session_persists_event(tmp_path):
+    """Corrección post-incidente (2026-09-08): el motivo del kill-switch debe
+    quedar en la DB, no sólo en journald (que ya demostró rotar en horas)."""
+    flag = tmp_path / "HALT"
+    session_factory = _session_factory()
+    with session_factory() as session:
+        kill_switch.halt("prueba con persistencia", str(flag), session=session)
+
+    with session_factory() as session:
+        events = session.execute(select(RealExecutionEvent)).scalars().all()
+        assert len(events) == 1
+        assert events[0].event_type == "kill_switch_triggered"
+        assert events[0].severity == "critical"
+        assert "prueba con persistencia" in events[0].message
+
+
+def test_halt_with_session_does_not_duplicate_event_if_already_halted(tmp_path):
+    flag = tmp_path / "HALT"
+    session_factory = _session_factory()
+    with session_factory() as session:
+        kill_switch.halt("primer motivo", str(flag), session=session)
+        kill_switch.halt("segundo motivo", str(flag), session=session)
+
+    with session_factory() as session:
+        events = session.execute(select(RealExecutionEvent)).scalars().all()
+        assert len(events) == 1
 
 
 def test_check_balance_kill_switch_ok_above_floor(tmp_path):

@@ -10,7 +10,7 @@ from py_clob_client_v2 import AssetType, BalanceAllowanceParams, ClobClient
 from sqlalchemy import func, select
 
 from polybot.config import CLOB_API_URL, POLYGON_CHAIN_ID, settings
-from polybot.execution import kill_switch
+from polybot.execution import kill_switch, reconciliation
 from polybot.execution.allowances import ensure_collateral_allowance
 from polybot.execution.key_management import load_private_key
 from polybot.execution.real_executor import RealExecutionEngine
@@ -313,6 +313,11 @@ async def real_balance_kill_switch_loop(client) -> None:
     `execution.kill_switch`). Corre en el mismo event loop que todo lo demás,
     pero la llamada HTTP del cliente CLOB no bloquea porque se ejecuta en un
     executor aparte (`asyncio.to_thread`) -- el SDK es síncrono.
+
+    También corre acá la reconciliación de balance (`execution.reconciliation`,
+    agregada tras el incidente del 2026-09-08): mismo balance ya consultado,
+    se reusa para comparar contra lo que `real_positions` implica que debería
+    haber, sin pagar una consulta HTTP extra.
     """
     while True:
         try:
@@ -320,7 +325,9 @@ async def real_balance_kill_switch_loop(client) -> None:
                 client.get_balance_allowance, BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
             current_balance = float(balance.get("balance", 0) or 0) / 1_000_000  # USDC, 6 decimales
-            kill_switch.check_balance_kill_switch(current_balance)
+            with get_session() as session:
+                reconciliation.check_balance_reconciliation(session, current_balance)
+                kill_switch.check_balance_kill_switch(current_balance, session=session)
         except Exception:
             logger.exception("Fallo consultando balance real, se reintenta en el próximo ciclo")
         await asyncio.sleep(settings.real_balance_check_interval_seconds)

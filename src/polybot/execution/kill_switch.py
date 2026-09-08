@@ -23,6 +23,8 @@ import datetime as dt
 import logging
 import os
 
+from sqlalchemy.orm import Session
+
 from polybot.config import settings
 
 logger = logging.getLogger(__name__)
@@ -32,19 +34,30 @@ def is_halted(flag_path: str | None = None) -> bool:
     return os.path.exists(flag_path or settings.real_kill_switch_flag_path)
 
 
-def halt(reason: str, flag_path: str | None = None) -> None:
+def halt(reason: str, flag_path: str | None = None, session: Session | None = None) -> None:
     """Escribe el flag de parada si todavía no existe (idempotente -- no pisa el
-    motivo/timestamp de una parada previa si ya estaba activa)."""
+    motivo/timestamp de una parada previa si ya estaba activa). Si se pasa
+    `session`, además persiste el evento en `real_execution_events` (ver
+    `execution.event_log`) -- el archivo flag por sí solo ya detiene el
+    trading real (eso no depende de la DB), pero sin esto el motivo de la
+    parada sólo vivía en journald, que ya demostró rotar en horas."""
     path = flag_path or settings.real_kill_switch_flag_path
-    if os.path.exists(path):
-        return
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        f.write(f"{dt.datetime.now(dt.UTC).isoformat()} -- {reason}\n")
-    logger.critical("KILL-SWITCH ACTIVADO: %s (flag: %s)", reason, path)
+    already_halted = os.path.exists(path)
+    if not already_halted:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            f.write(f"{dt.datetime.now(dt.UTC).isoformat()} -- {reason}\n")
+        logger.critical("KILL-SWITCH ACTIVADO: %s (flag: %s)", reason, path)
+
+    if session is not None and not already_halted:
+        from polybot.execution.event_log import log_event
+
+        log_event(session, "kill_switch_triggered", "critical", f"KILL-SWITCH ACTIVADO: {reason}")
 
 
-def check_balance_kill_switch(current_balance_usd: float, flag_path: str | None = None) -> bool:
+def check_balance_kill_switch(
+    current_balance_usd: float, flag_path: str | None = None, session: Session | None = None
+) -> bool:
     """Activa el kill-switch automático si el balance real cae bajo el piso
     configurado (`REAL_KILL_SWITCH_BALANCE_FLOOR_USD`, default $15 = 25% de
     drawdown sobre $20 base). Devuelve True si el trading real está detenido
@@ -54,5 +67,6 @@ def check_balance_kill_switch(current_balance_usd: float, flag_path: str | None 
         halt(
             f"balance real ${current_balance_usd:.2f} por debajo del piso ${floor:.2f}",
             flag_path=flag_path,
+            session=session,
         )
     return is_halted(flag_path)
