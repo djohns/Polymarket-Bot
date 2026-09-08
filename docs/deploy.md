@@ -350,29 +350,45 @@ en la VPS (está cifrado) pero nunca se commitea -- ya cae bajo el patrón
 
 La passphrase se lee en runtime desde la variable de entorno
 `POLYMARKET_KEY_PASSPHRASE` (configurable vía `REAL_KEY_PASSPHRASE_ENV_VAR`),
-separada del `.env` principal a propósito -- nunca queda persistida en disco
-sin cifrar. Con systemd, esto se resuelve con un *drop-in* de entorno que el
-usuario carga a mano antes de (re)iniciar el servicio, en vez de un
-`Environment=` fijo en el unit file (que sí quedaría en disco en claro):
+separada del `.env` principal a propósito. Mecanismo elegido (y ya versionado
+en `deploy/polymarket-bot.service`): un `EnvironmentFile=` de systemd que
+apunta a `/etc/polymarket-bot-secret.env`, un archivo **fuera del repo**, con
+permisos `600` y propietario `opc`, que sólo contiene esa variable:
 
 ```bash
-sudo systemd-run --scope --uid=opc --gid=opc \
-  --setenv=POLYMARKET_KEY_PASSPHRASE="<passphrase>" \
-  systemctl --user start polymarket-bot.service
+sudo tee /etc/polymarket-bot-secret.env > /dev/null <<'EOF'
+POLYMARKET_KEY_PASSPHRASE=<passphrase>
+EOF
+sudo chmod 600 /etc/polymarket-bot-secret.env
+sudo chown opc:opc /etc/polymarket-bot-secret.env
 ```
 
-O, más simple para uso manual (no recomendado para systemd de sistema, pero
-válido si se corre el proceso a mano durante el setup/pruebas):
+El unit file referencia este archivo con el prefijo `-` (`EnvironmentFile=-/etc/polymarket-bot-secret.env`)
+para que su ausencia no rompa el arranque en Fase 1/2 (sin capital real, sin
+passphrase que exportar). Reinstalar el unit tras actualizar el repo:
 
 ```bash
-export POLYMARKET_KEY_PASSPHRASE="<passphrase>"
-.venv/bin/python -m polybot.main
+cd /opt/polymarket-bot
+git pull
+sudo cp deploy/polymarket-bot.service /etc/systemd/system/
+sudo restorecon -v /etc/systemd/system/polymarket-bot.service
+sudo systemctl daemon-reload
+sudo systemctl restart polymarket-bot.service
 ```
+
+Se prefirió esto sobre `Environment=` fijo en el unit (que también quedaría
+en disco, pero commiteado/versionado y visible a cualquiera con acceso al
+repo) y sobre exportar la variable a mano en cada arranque manual
+(`export POLYMARKET_KEY_PASSPHRASE=...` antes de `python -m polybot.main`,
+todavía válido para pruebas puntuales sin systemd) porque un servicio que se
+reinicia solo vía `Restart=on-failure` necesita que la passphrase esté
+disponible en cada reinicio automático, no sólo en el primer arranque manual.
 
 **No** guardar esta variable en `/etc/environment`, en el unit file de
-systemd, ni en ningún archivo que persista en disco sin cifrar -- se exporta
-en la sesión de shell que arranca el proceso, y se pierde al cerrar esa
-sesión (intencional).
+systemd (commiteado en el repo), ni en ningún archivo dentro de
+`/opt/polymarket-bot` -- vive únicamente en `/etc/polymarket-bot-secret.env`,
+fuera del árbol del repo, sin cifrar en disco pero con permisos restrictivos
+como única defensa (igual que `.env` para el resto de credenciales).
 
 ### 4. Activar Fase 3
 

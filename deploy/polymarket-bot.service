@@ -11,6 +11,10 @@ User=opc
 Group=opc
 WorkingDirectory=/opt/polymarket-bot
 Environment=PYTHONUNBUFFERED=1
+# Fase 3: passphrase de descifrado de la private key real, separada del .env
+# principal a propósito -- no versionar este archivo, vive sólo en la VPS
+# (permisos 600, propietario opc). Ver docs/deploy.md.
+EnvironmentFile=-/etc/polymarket-bot-secret.env
 ExecStart=/opt/polymarket-bot/.venv/bin/python -m polybot.main
 Restart=on-failure
 RestartSec=30
