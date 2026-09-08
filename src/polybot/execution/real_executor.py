@@ -45,7 +45,8 @@ from __future__ import annotations
 
 import logging
 
-from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
+from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType, TradeParams
+from py_clob_client_v2.constants import FAILED_TRADE_STATUS
 from py_clob_client_v2.order_utils.model.side import SideString
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -102,13 +103,21 @@ def _order_matched(response: dict) -> bool:
 
 
 def _confirm_via_order_status(client, order_id: str) -> bool | None:
-    """Última instancia cuando la respuesta inicial no trae ni hashes ni
-    tradeIDs: consulta el estado de la orden por su ID directamente
-    (`GET /order/{id}`). Devuelve True/False si la respuesta trae una señal
-    reconocible (`size_matched` > 0, o un `status` de matched/filled vs.
-    unmatched/cancelado), o None si la consulta falla o la forma de la
-    respuesta no se puede interpretar con confianza -- caso en el que
-    `_is_order_filled` decide qué asumir, no esta función."""
+    """Consulta el estado de la orden por su ID directamente (`GET /order/{id}`).
+
+    **Validado contra el servidor real y resultó inútil para este caso de uso**
+    (ver CLAUDE.md, sección Fase 3): para las 4 órdenes de mercado FOK del
+    incidente del 2026-09-08, ya asentadas y confirmadas,
+    `client.get_order(order_id)` devolvió `None` en las 4 -- no una excepción,
+    no un dict con campos reconocibles, directamente `None`. La hipótesis
+    (razonable a priori) de que traería `size_matched`/`status` no se sostuvo
+    en la práctica: `get_order` parece servir sólo órdenes resting/abiertas,
+    no el registro post-hoc de una orden de mercado ya ejecutada y liquidada.
+    Se deja esta función como intento adicional de bajo costo (si alguna vez
+    sí devuelve algo reconocible, se usa), pero la señal real que sí funciona
+    para este escenario es `_confirm_via_trades` -- ver ahí. Devuelve
+    True/False si la respuesta trae una señal reconocible, o None si la
+    consulta falla, devuelve `None`/algo no interpretable, o no aporta nada."""
     try:
         order = client.get_order(order_id)
     except Exception:
@@ -132,21 +141,48 @@ def _confirm_via_order_status(client, order_id: str) -> bool | None:
     return None
 
 
-def _is_order_filled(client, response: dict) -> bool:
+def _confirm_via_trades(client, token_id: str, order_id: str) -> bool | None:
+    """Busca, vía `get_trades(asset_id=token_id)`, el trade cuyo
+    `taker_order_id` coincide con `order_id` -- ésta es la señal que SÍ
+    funciona contra el servidor real para una orden de mercado FOK ya
+    ejecutada (validado con las 4 órdenes reales del incidente del
+    2026-09-08: las 4 aparecieron acá con `status="CONFIRMED"`, mientras que
+    `get_order` devolvía `None` para las mismas). `FAILED` (la única
+    constante de estado fallido que expone el propio SDK,
+    `constants.FAILED_TRADE_STATUS`) es la única lectura negativa; cualquier
+    otro estado (`CONFIRMED`, `MATCHED`, `MINED`, `RETRYING`, ...) implica que
+    el trade existe -- matcheó -- aunque su liquidación on-chain todavía esté
+    en curso. Devuelve None si la consulta falla o no aparece ningún trade
+    con ese `taker_order_id` (inconcluso, no es lo mismo que "no llenó")."""
+    try:
+        trades = client.get_trades(TradeParams(asset_id=token_id), only_first_page=True)
+    except Exception:
+        logger.warning("No se pudo confirmar el estado de la orden %s vía get_trades", order_id, exc_info=True)
+        return None
+    for trade in trades or []:
+        if trade.get("taker_order_id") == order_id or trade.get("takerOrderId") == order_id:
+            return str(trade.get("status", "")).upper() != FAILED_TRADE_STATUS
+    return None
+
+
+def _is_order_filled(client, response: dict, token_id: str) -> bool:
     """Determina si una orden real llenó. Ya NO confía únicamente en
     `transactionsHashes` (ver el incidente documentado en el docstring del
     módulo): ese campo se resuelve "best-effort" y puede llegar vacío en una
     orden que sí llenó. Orden de señales, de más a menos directa:
     1. `transactionsHashes`/`tradeIDs` en la respuesta inicial (`_order_matched`).
     2. Si la respuesta no trae ninguna de las dos pero sí un `orderID`, se
-       hace una consulta explícita de estado (`_confirm_via_order_status`).
-    3. Si esa consulta es inconclusa (falla, o no trae una señal
-       reconocible), se asume LLENADA, no al revés -- la lección del
-       incidente fue exactamente el error opuesto: tratar una ambigüedad
-       como "no llenó" dejó una orden real con capital gastado sin registrar
-       en ningún lado. Sin `orderID` en absoluto (nunca se registró intento
-       de orden) sí se concluye con confianza que no llenó -- ahí no hay
-       ambigüedad que resolver a favor de la cautela.
+       busca el trade asociado vía `get_trades` (`_confirm_via_trades`) --
+       ésta es la señal validada contra el servidor real, ver su docstring.
+    3. `_confirm_via_order_status` (`get_order`) como intento adicional de
+       bajo costo -- en la práctica no aportó nada contra el servidor real
+       (ver su docstring), se mantiene por si acaso.
+    4. Si TODO lo anterior es inconcluso, se asume LLENADA, no al revés --
+       la lección del incidente fue exactamente el error opuesto: tratar una
+       ambigüedad como "no llenó" dejó una orden real con capital gastado sin
+       registrar en ningún lado. Sin `orderID` en absoluto (nunca se registró
+       intento de orden) sí se concluye con confianza que no llenó -- ahí no
+       hay ambigüedad que resolver a favor de la cautela.
     """
     if _order_matched(response):
         return True
@@ -154,6 +190,10 @@ def _is_order_filled(client, response: dict) -> bool:
     order_id = response.get("orderID") or response.get("orderId")
     if not order_id:
         return False
+
+    confirmed = _confirm_via_trades(client, token_id, order_id)
+    if confirmed is not None:
+        return confirmed
 
     confirmed = _confirm_via_order_status(client, order_id)
     return confirmed if confirmed is not None else True
@@ -243,7 +283,7 @@ class RealExecutionEngine:
         position.yes_tx_hash = str((yes_resp.get("transactionsHashes") or [None])[0]) or None
         session.commit()
 
-        if not _is_order_filled(self._client, yes_resp):
+        if not _is_order_filled(self._client, yes_resp, market.yes_token_id):
             position.status = "cancelada"
             session.commit()
             log_event(
@@ -285,7 +325,7 @@ class RealExecutionEngine:
         position.no_tx_hash = str((no_resp.get("transactionsHashes") or [None])[0]) or None
         session.commit()
 
-        if not _is_order_filled(self._client, no_resp):
+        if not _is_order_filled(self._client, no_resp, market.no_token_id):
             log_event(
                 session,
                 "leg_imbalance",

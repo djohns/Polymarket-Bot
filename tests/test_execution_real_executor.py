@@ -48,13 +48,24 @@ def _session_factory():
 class FakeClient:
     """`order_responses` se consumen en orden para `create_and_post_market_order`.
     `order_status_responses` (opcional, por orderID) simula `get_order` -- si un
-    orderID no tiene entrada, `get_order` lanza (simula que la consulta falla)."""
+    orderID no tiene entrada, `get_order` lanza (simula que la consulta falla).
+    `trades` (opcional) simula `get_trades` -- lista de dicts con al menos
+    `taker_order_id` y `status`; por default vacía (simula que get_trades no
+    encuentra nada, igual que un cliente sin ese método haría fallar la
+    consulta)."""
 
-    def __init__(self, order_responses: list[dict], order_status_responses: dict | None = None) -> None:
+    def __init__(
+        self,
+        order_responses: list[dict],
+        order_status_responses: dict | None = None,
+        trades: list[dict] | None = None,
+    ) -> None:
         self._order_responses = list(order_responses)
         self._order_status_responses = order_status_responses or {}
+        self._trades = trades if trades is not None else []
         self.calls: list[tuple] = []
         self.get_order_calls: list[str] = []
+        self.get_trades_calls: list[dict] = []
 
     def create_and_post_market_order(self, order_args, order_type=None):
         self.calls.append((order_args.token_id, order_args.amount))
@@ -65,6 +76,10 @@ class FakeClient:
         if order_id not in self._order_status_responses:
             raise RuntimeError(f"orden {order_id} no encontrada (simulado)")
         return self._order_status_responses[order_id]
+
+    def get_trades(self, params, only_first_page=False):
+        self.get_trades_calls.append({"asset_id": params.asset_id})
+        return self._trades
 
 
 def _enable_real_trading(request, tmp_path):
@@ -211,6 +226,52 @@ def test_ambiguous_order_status_defaults_to_filled_not_abandoned(request, tmp_pa
     with session_factory() as session:
         positions = session.execute(select(RealPosition)).scalars().all()
         assert positions[0].status == "abierta"
+
+
+def test_confirmed_filled_via_get_trades_matches_real_incident_scenario(request, tmp_path):
+    """Reproduce exactamente lo observado contra el servidor real (ver
+    CLAUDE.md, sección Fase 3): para una orden de mercado FOK ya ejecutada,
+    get_order() devuelve None (inútil), pero get_trades() sí trae el trade
+    asociado con status="CONFIRMED". _confirm_via_trades debe reconocerlo
+    como llenada sin necesitar el fallback conservador de "asumir llenada"."""
+    _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": [], "orderID": "yes-order"},
+            {"transactionsHashes": ["0xno"], "orderID": "no-order"},
+        ],
+        order_status_responses={},  # get_order("yes-order") no configurado -> lanza, igual que en la realidad
+        trades=[{"taker_order_id": "yes-order", "status": "CONFIRMED"}],
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert len(client.get_trades_calls) == 1
+    assert client.get_trades_calls[0]["asset_id"] == "yes"
+    with session_factory() as session:
+        positions = session.execute(select(RealPosition)).scalars().all()
+        assert positions[0].status == "abierta"
+
+
+def test_confirmed_not_filled_via_get_trades_is_cancelled_not_abandoned(request, tmp_path):
+    """FAILED_TRADE_STATUS ("FAILED") es la única lectura negativa que expone
+    el SDK -- un trade con ese status significa que matcheó pero no liquidó."""
+    _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [{"transactionsHashes": [], "orderID": "yes-order"}],
+        trades=[{"taker_order_id": "yes-order", "status": "FAILED"}],
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert len(client.calls) == 1  # nunca se intentó la pata NO
+    with session_factory() as session:
+        positions = session.execute(select(RealPosition)).scalars().all()
+        assert positions[0].status == "cancelada"
 
 
 def test_confirmed_not_filled_via_get_order_is_cancelled_not_abandoned(request, tmp_path):

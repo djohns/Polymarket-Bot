@@ -887,12 +887,50 @@ en el repo como referencia/auditoría, no pensado para volver a correrse).
 on-chain); `shares`/`yes_price_avg` son estimados a partir del
 `simulated_position` más cercano en el tiempo para el mismo mercado (mismo
 book, mismo precio observado), no un valor confirmado por el exchange -- cada
-fila lo deja explícito en `notes`.
+fila lo deja explícito en `notes`. **Nota post-validación**: al confirmar el
+punto 1 de abajo se encontraron los `taker_order_id` reales de las 4 órdenes
+vía `get_trades`, con precio/tamaño exactos del exchange (ej. Aston Villa FC
+fue price=0.48 size=6.125, no el 0.56/5.25 estimado acá) -- quedó pendiente
+si vale la pena corregir estas 4 filas con esos valores más precisos; no se
+hizo en esta sesión para no introducir más aproximación sobre el componente
+de fee, que sigue sin poder reconciliarse con precisión contra el monto
+exacto transferido on-chain.
+
+### Punto 1 validado contra el servidor real -- `_confirm_via_order_status` no servía, `_confirm_via_trades` sí
+
+Con las 4 órdenes reales del incidente ya identificables (`get_trades(maker_address=<funder>)`
+trae sus 4 trades, cada uno con `taker_order_id`), se pudo probar
+`client.get_order(taker_order_id)` contra el servidor real por primera vez:
+**devolvió `None` en las 4**, no una excepción, no un dict con
+`size_matched`/`status` -- directamente `None`. La hipótesis original (que
+`get_order` traería un status reconocible) no se sostuvo: para una orden de
+mercado FOK ya ejecutada y liquidada, `get_order` parece servir sólo
+órdenes resting/abiertas, no el registro post-hoc de una ya completada.
+
+La señal que sí funcionó: **`get_trades(asset_id=token_id)`**, filtrando
+client-side por `taker_order_id == order_id` -- las 4 aparecieron ahí con
+`status: "CONFIRMED"`. Se agregó `_confirm_via_trades` como el fallback real
+(antes de `_confirm_via_order_status`, que se deja como intento adicional de
+bajo costo aunque no aportó nada en la práctica) en `_is_order_filled`. La
+única lectura negativa reconocida es `status == "FAILED"` (la constante que
+el propio SDK expone, `constants.FAILED_TRADE_STATUS`) -- cualquier otro
+status (`CONFIRMED`, `MATCHED`, `MINED`, `RETRYING`, ...) se lee como "el
+trade existe, matcheó", aunque su liquidación on-chain siga en curso.
+Cubierto en `tests/test_execution_real_executor.py`:
+`test_confirmed_filled_via_get_trades_matches_real_incident_scenario`
+reproduce exactamente lo observado (get_order inútil, get_trades con
+`CONFIRMED`); `test_confirmed_not_filled_via_get_trades_is_cancelled_not_abandoned`
+cubre la única lectura negativa (`FAILED`).
+
+Con esto, la cadena de señales de `_is_order_filled` queda: (1)
+`transactionsHashes`/`tradeIDs` en la respuesta inicial, (2) `get_trades`
+filtrado por `taker_order_id` (validado contra el servidor real), (3)
+`get_order` (no validado como útil, pero inofensivo dejarlo), (4) si todo lo
+anterior es inconcluso, asumir llenada -- la corrección central del
+incidente, ya no depende de que (2)/(3) funcionen para seguir siendo segura.
 
 ### Pendiente para la próxima activación
 
-- Validar el formato real de la respuesta de `client.get_order()` contra un
-  caso real (punto 1 arriba) durante el próximo setup supervisado.
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
   puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
