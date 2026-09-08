@@ -123,7 +123,17 @@ class RealExecutionEngine:
         try:
             yes_resp = _place_market_buy(self._client, market.yes_token_id, yes_budget)
         except Exception:
-            logger.exception("Fallo al enviar la orden YES real en %s, se aborta el trade", market.question[:60])
+            # Falla al ENVIAR la orden YES (red/timeout/excepción del cliente) -- todavía no
+            # se gastó capital real, así que no es un leg imbalance. Igual se loguea CRITICAL
+            # (no sólo la traza de logger.exception) con el detalle del intento -- para capital
+            # real no puede quedar un punto ciego sobre por qué un trade no se ejecutó, aunque
+            # el resultado en sí (nada de capital tocado) sea el peor caso benigno posible.
+            logger.critical(
+                "Fallo al ENVIAR la orden YES real en %s (budget=%.2f) -- no se gastó capital, se aborta el trade",
+                market.question[:60],
+                yes_budget,
+                exc_info=True,
+            )
             return
 
         if not _order_filled(yes_resp):
@@ -133,7 +143,16 @@ class RealExecutionEngine:
         try:
             no_resp = _place_market_buy(self._client, market.no_token_id, no_budget)
         except Exception:
-            logger.exception("Fallo al enviar la orden NO real en %s tras llenar YES", market.question[:60])
+            # A diferencia del caso anterior, acá la pata YES SÍ llenó -- ya hay capital real
+            # comprometido y esto es un leg imbalance real, mismo nivel de riesgo que "NO no
+            # llenó" más abajo. CRITICAL + _handle_leg_imbalance (que dispara el kill-switch).
+            logger.critical(
+                "Fallo al ENVIAR la orden NO real en %s (budget=%.2f) tras llenar YES -- "
+                "posición desbalanceada con capital real ya comprometido",
+                market.question[:60],
+                no_budget,
+                exc_info=True,
+            )
             self._handle_leg_imbalance(session, market, fill, yes_resp, no_resp=None)
             return
 
