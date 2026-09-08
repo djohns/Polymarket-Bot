@@ -72,6 +72,14 @@ class Settings:
     real_encrypted_key_path: str = os.getenv("REAL_ENCRYPTED_KEY_PATH", "data/private_key.enc")
     real_key_passphrase_env_var: str = os.getenv("REAL_KEY_PASSPHRASE_ENV_VAR", "POLYMARKET_KEY_PASSPHRASE")
     real_balance_check_interval_seconds: int = _int_env("REAL_BALANCE_CHECK_INTERVAL_SECONDS", 300)
+    # Proxy wallet ("Safe Wallet") que Polymarket asigna a cuentas conectadas con wallet
+    # externa (MetaMask/Rabby) -- ahí vive el pUSD real, no en la EOA firmante. Sin
+    # default: es específico de cada cuenta, no tiene un valor razonable genérico.
+    real_funder_address: str | None = os.getenv("REAL_FUNDER_ADDRESS")
+    # POLY_GNOSIS_SAFE=2 por defecto: es el signature_type documentado por Polymarket
+    # para cuentas creadas con wallet externa (ver CLAUDE.md, sección Fase 3, para la
+    # fuente exacta). Configurable por si el tipo de cuenta cambia en el futuro.
+    real_signature_type: int = _int_env("REAL_SIGNATURE_TYPE", 2)
 
 
 settings = Settings()

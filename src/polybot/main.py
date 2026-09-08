@@ -254,6 +254,14 @@ def _build_real_execution_engine() -> RealExecutionEngine | None:
         )
         return None
 
+    if not settings.real_funder_address:
+        logger.critical(
+            "REAL_FUNDER_ADDRESS no está configurado -- sin la proxy wallet (Safe Wallet) "
+            "correcta el cliente operaría contra la EOA, que no tiene el pUSD real. "
+            "Fase 3 no arranca."
+        )
+        return None
+
     private_key = load_private_key(settings.real_encrypted_key_path, settings.real_key_passphrase_env_var)
     creds_ok = all([settings.clob_api_key, settings.clob_api_secret, settings.clob_api_passphrase])
     from py_clob_client_v2 import ApiCreds
@@ -267,7 +275,19 @@ def _build_real_execution_engine() -> RealExecutionEngine | None:
         if creds_ok
         else None
     )
-    client = ClobClient(host=CLOB_API_URL, chain_id=POLYGON_CHAIN_ID, key=private_key, creds=creds)
+    # signature_type/funder: la cuenta se conectó con una wallet externa (MetaMask), a la
+    # que Polymarket le asigna una "Safe Wallet" (Gnosis Safe) como proxy -- ahí vive el
+    # pUSD real, no en la EOA firmante. Ver CLAUDE.md, sección Fase 3, para la fuente
+    # exacta (docs.polymarket.com/trading/wallets-auth) de por qué esto es
+    # POLY_GNOSIS_SAFE=2 y no POLY_PROXY=1 (ese es para cuentas de Magic Link/email).
+    client = ClobClient(
+        host=CLOB_API_URL,
+        chain_id=POLYGON_CHAIN_ID,
+        key=private_key,
+        creds=creds,
+        signature_type=settings.real_signature_type,
+        funder=settings.real_funder_address,
+    )
     del private_key  # no queda ninguna otra referencia en este scope
 
     if creds is None:

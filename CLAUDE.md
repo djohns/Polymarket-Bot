@@ -609,6 +609,50 @@ de las decisiones no obvias:
   nunca se pasan como argumento de línea de comandos ni quedan en el
   historial de shell o en `ps`). El usuario la corre a mano una vez (o cada
   vez que rota la key/passphrase).
+- **Proxy wallet ("Safe Wallet") y `signature_type` — descubierto durante la
+  verificación pre go-live, no en el diseño original**: el primer intento de
+  `get_balance_allowance` tras depositar pUSD real seguía devolviendo
+  `balance: "0"`. Se rastreó el depósito on-chain (Polygon, lectura pública) y
+  se confirmó que el pUSD no queda en la dirección que deriva la private key
+  (la EOA firmante, `0x7D7e...fB4d`) sino en una proxy wallet separada que
+  Polymarket le asigna a la cuenta (`0x1ed2...D119`, mostrada en la UI de
+  Polymarket como "dirección de desarrollador"/dirección de depósito — con la
+  advertencia explícita de la propia UI de no mandarle fondos directo, sólo
+  vía el flujo de Depósito). `py-clob-client-v2` expone esto con dos
+  parámetros del `ClobClient` que el diseño original de Fase 3 no pasaba:
+  `funder` (la dirección que de verdad tiene los fondos) y `signature_type`
+  (cómo se firma la orden en relación a esa dirección). Sin ellos, el cliente
+  asume por defecto `signature_type=EOA` y `funder=<la misma EOA firmante>` —
+  válido sólo para cuentas sin proxy wallet.
+  - **Qué `signature_type` corresponde a esta cuenta, y la fuente**: la
+    documentación oficial (docs.polymarket.com/trading/wallets-auth) distingue
+    tres tipos de wallet legacy: *Proxy Wallet* — "a legacy smart wallet
+    created through Magic Link or Google authentication" (`POLY_PROXY=1`) — y
+    *Safe Wallet* — para cuentas que "created [an account wallet] with an
+    external signer such as MetaMask or Rabby Wallet" (`POLY_GNOSIS_SAFE=2`).
+    Esta cuenta se conectó con MetaMask, así que corresponde **Safe Wallet /
+    `POLY_GNOSIS_SAFE=2`**, no `POLY_PROXY=1` (ese es específicamente para
+    Magic Link/email, no para wallets externas). El SDK (`SignatureTypeV2` en
+    `py_clob_client_v2/order_utils/model/signature_type_v2.py`) confirma la
+    misma enumeración de valores, pero no dice cuál corresponde a qué método
+    de login — eso sólo está en la documentación de Polymarket, no en el
+    código del cliente, así que hubo que buscarlo ahí en vez de asumir por el
+    nombre del enum.
+  - **El SDK no deriva el funder solo**: `OrderBuilder.__init__` lo documenta
+    explícitamente ("Address which holds funds... Used for Polymarket proxy
+    wallets and other smart contract wallets") y lo toma como parámetro
+    obligatorio si no es la EOA — no hay ninguna función de cómputo
+    determinístico (tipo CREATE2) en `py-clob-client-v2`. La dirección tiene
+    que salir de la cuenta real del usuario en polymarket.com, nunca
+    adivinarse ni derivarse.
+  - **Variables nuevas**: `REAL_FUNDER_ADDRESS` (sin default — específica de
+    cada cuenta; si no está seteado y `REAL_TRADING_ENABLED=true`, Fase 3 no
+    arranca, mismo patrón de gate que el kill-switch) y `REAL_SIGNATURE_TYPE`
+    (default `2`, ver arriba). Ambos se pasan al construir el `ClobClient` en
+    `main.py::_build_real_execution_engine`; de ahí los hereda todo lo demás
+    (`allowances.py`, `real_executor.py`, el loop de balance del kill-switch)
+    sin cambios propios, porque todos operan sobre la misma instancia de
+    cliente.
 - **Allowance de COLLATERAL**: se verifica/asegura al arrancar Fase 3 vía
   `get_balance_allowance` / `update_balance_allowance` de py-clob-client-v2
   (`execution/allowances.py`) — el SDK expone esto como llamada de API, no
@@ -661,7 +705,9 @@ de las decisiones no obvias:
   `REAL_KILL_SWITCH_BALANCE_FLOOR_USD` (15.0), `REAL_KILL_SWITCH_FLAG_PATH`
   (`data/REAL_TRADING_HALTED`), `REAL_ENCRYPTED_KEY_PATH`
   (`data/private_key.enc`), `REAL_KEY_PASSPHRASE_ENV_VAR`
-  (`POLYMARKET_KEY_PASSPHRASE`), `REAL_BALANCE_CHECK_INTERVAL_SECONDS` (300).
+  (`POLYMARKET_KEY_PASSPHRASE`), `REAL_BALANCE_CHECK_INTERVAL_SECONDS` (300),
+  `REAL_FUNDER_ADDRESS` (sin default, específica de la cuenta),
+  `REAL_SIGNATURE_TYPE` (2 = `POLY_GNOSIS_SAFE`, ver arriba por qué).
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
