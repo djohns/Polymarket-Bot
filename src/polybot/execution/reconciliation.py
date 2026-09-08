@@ -12,6 +12,8 @@ que alguien audite a mano para notarlo.
 """
 from __future__ import annotations
 
+import datetime as dt
+
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -23,19 +25,44 @@ from polybot.persistence.models import RealPosition
 
 def expected_balance_usd(session: Session) -> float:
     """Balance que debería haber en la wallet según lo que `real_positions`
-    ya sabe: el capital base menos lo comprometido en posiciones que todavía
-    no devolvieron el capital ("enviada"/"abierta"/"pendiente" -- cualquier
-    estado donde el capital salió de la wallet y no hay certeza de que haya
-    vuelto), más el P&L ya realizado de las posiciones cerradas."""
-    committed = session.execute(
-        select(func.coalesce(func.sum(RealPosition.cost_usd), 0.0)).where(
+    ya sabe.
+
+    Con `REAL_BALANCE_CHECKPOINT_USD` + `REAL_BALANCE_CHECKPOINT_AT` seteados
+    (el balance real confirmado la última vez que se supo que
+    `real_positions` estaba al día -- ej. justo después de un backfill): esa
+    referencia, ajustada sólo por posiciones abiertas DESDE ese momento
+    (`opened_at >= checkpoint_at`) -- las posiciones anteriores al checkpoint
+    ya están reflejadas en el balance observado ese día, sumarlas de nuevo
+    las contaría dos veces.
+
+    Sin el par de checkpoint (caso simple, ej. una wallet recién fondeada):
+    usa `REAL_CAPITAL_BASE_USD` como aproximación nominal contra TODAS las
+    posiciones -- válido sólo si el balance real de arranque coincidía con
+    ese número exacto.
+    """
+    if settings.real_balance_checkpoint_usd is not None and settings.real_balance_checkpoint_at:
+        reference = settings.real_balance_checkpoint_usd
+        since = dt.datetime.fromisoformat(settings.real_balance_checkpoint_at)
+        committed_stmt = select(func.coalesce(func.sum(RealPosition.cost_usd), 0.0)).where(
+            RealPosition.status.in_(("enviada", "abierta", "pendiente")),
+            RealPosition.opened_at >= since,
+        )
+        realized_stmt = select(func.coalesce(func.sum(RealPosition.realized_pnl), 0.0)).where(
+            RealPosition.status == "cerrada",
+            RealPosition.opened_at >= since,
+        )
+    else:
+        reference = settings.real_capital_base_usd
+        committed_stmt = select(func.coalesce(func.sum(RealPosition.cost_usd), 0.0)).where(
             RealPosition.status.in_(("enviada", "abierta", "pendiente"))
         )
-    ).scalar_one()
-    realized = session.execute(
-        select(func.coalesce(func.sum(RealPosition.realized_pnl), 0.0)).where(RealPosition.status == "cerrada")
-    ).scalar_one()
-    return settings.real_capital_base_usd - committed + realized
+        realized_stmt = select(func.coalesce(func.sum(RealPosition.realized_pnl), 0.0)).where(
+            RealPosition.status == "cerrada"
+        )
+
+    committed = session.execute(committed_stmt).scalar_one()
+    realized = session.execute(realized_stmt).scalar_one()
+    return reference - committed + realized
 
 
 def check_balance_reconciliation(session: Session, actual_balance_usd: float) -> bool:

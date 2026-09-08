@@ -76,6 +76,20 @@ class Settings:
     # `real_positions` implica que debería haber, antes de considerarlo una
     # señal de que algo quedó sin registrar (ver incidente del 2026-09-08).
     real_reconciliation_threshold_usd: float = _float_env("REAL_RECONCILIATION_THRESHOLD_USD", 0.50)
+    # Punto de referencia para la reconciliación: el balance real CONFIRMADO
+    # (vía get_balance_allowance) al momento `REAL_BALANCE_CHECKPOINT_AT`,
+    # asumiendo que en ese momento `real_positions` ya reflejaba todo lo
+    # sucedido hasta ahí (por eso importa re-fijar el par tras cada backfill/
+    # incidente resuelto). Sin esto, el default (`real_capital_base_usd`,
+    # sin filtro de fecha) es sólo una aproximación nominal -- en la práctica
+    # casi siempre difiere un poco del balance real desde el arranque (fees
+    # de depósito, redondeo, rebates), generando divergencias falsas. Los dos
+    # van juntos: sin `REAL_BALANCE_CHECKPOINT_AT`, `REAL_BALANCE_CHECKPOINT_USD`
+    # se ignora (no hay forma de saber qué posiciones son "desde" el
+    # checkpoint sin la fecha). Ver CLAUDE.md, sección Fase 3, incidente del
+    # 2026-09-08.
+    real_balance_checkpoint_usd: float | None = _float_env("REAL_BALANCE_CHECKPOINT_USD", 0.0) or None
+    real_balance_checkpoint_at: str | None = os.getenv("REAL_BALANCE_CHECKPOINT_AT") or None
     # Proxy wallet ("Safe Wallet") que Polymarket asigna a cuentas conectadas con wallet
     # externa (MetaMask/Rabby) -- ahí vive el pUSD real, no en la EOA firmante. Sin
     # default: es específico de cada cuenta, no tiene un valor razonable genérico.

@@ -845,7 +845,7 @@ y `tests/test_execution_kill_switch.py::test_halt_with_session_persists_event`.
 el balance real cada `REAL_BALANCE_CHECK_INTERVAL_SECONDS` (300s,
 `main.py::real_balance_kill_switch_loop` -- se le agregó esto en vez de crear
 un loop nuevo, reusando la misma llamada HTTP ya pagada).
-`expected_balance_usd(session)` = `REAL_CAPITAL_BASE_USD` menos el `cost_usd`
+`expected_balance_usd(session)` = un punto de referencia menos el `cost_usd`
 de toda posición en `"enviada"`/`"abierta"`/`"pendiente"` (capital que salió
 de la wallet y no hay certeza de que haya vuelto) más el `realized_pnl` de
 las posiciones `"cerrada"`. Si el balance real diverge de eso por más de
@@ -857,6 +857,26 @@ depender de una auditoría manual. No distingue automáticamente "algo quedó
 sin registrar" de "hubo actividad manual en la cuenta fuera del bot" (ambas
 producen la misma divergencia) -- en cualquier caso, detener el trading real
 hasta que alguien lo entienda es el comportamiento correcto.
+
+- **El punto de referencia por defecto (`REAL_CAPITAL_BASE_USD`, sin filtro de
+  fecha) generó una divergencia falsa al verificar esta misma corrección**:
+  con las 4 posiciones del incidente ya backfilleadas como `"cerrada"`, el
+  balance real confirmado era $22.727494 pero `expected_balance_usd` daba
+  $19.55 -- una diferencia de $3.18, muy por encima del umbral. La causa: el
+  capital base nominal ($20) nunca fue el balance real de arranque (el
+  depósito real fue $22.33 antes de que ocurriera nada del incidente), así
+  que restar/sumar posiciones contra ese número nominal no podía coincidir
+  con la realidad. Fix: `REAL_BALANCE_CHECKPOINT_USD` +
+  `REAL_BALANCE_CHECKPOINT_AT` (van siempre juntos) fijan el balance real
+  CONFIRMADO en una fecha conocida como referencia, y `expected_balance_usd`
+  sólo suma/resta posiciones con `opened_at >= checkpoint_at` -- las
+  anteriores al checkpoint ya están reflejadas en ese balance observado,
+  sumarlas de nuevo las contaría dos veces. Tras el backfill de este
+  incidente se fijó el checkpoint al balance confirmado post-backfill
+  ($22.727494, 2026-09-08 ~22:10 UTC) -- sin ninguna posición pendiente en
+  ese momento, es un punto limpio para arrancar la reconciliación de cero.
+  Sin el par de checkpoint seteado, se mantiene el comportamiento nominal
+  (capital base, sin filtro de fecha) como fallback simple.
 
 ### Backfill retroactivo
 
