@@ -276,10 +276,10 @@ def _build_real_execution_engine() -> RealExecutionEngine | None:
         else None
     )
     # signature_type/funder: la cuenta se conectó con una wallet externa (MetaMask), a la
-    # que Polymarket le asigna una "Safe Wallet" (Gnosis Safe) como proxy -- ahí vive el
-    # pUSD real, no en la EOA firmante. Ver CLAUDE.md, sección Fase 3, para la fuente
-    # exacta (docs.polymarket.com/trading/wallets-auth) de por qué esto es
-    # POLY_GNOSIS_SAFE=2 y no POLY_PROXY=1 (ese es para cuentas de Magic Link/email).
+    # que Polymarket le asigna una proxy wallet -- ahí vive el pUSD real, no en la EOA
+    # firmante. El valor de signature_type se verificó empíricamente contra el balance
+    # real (no se asumió de la documentación general) -- ver CLAUDE.md, sección Fase 3,
+    # para el detalle completo de por qué es POLY_1271=3 y no POLY_GNOSIS_SAFE=2.
     client = ClobClient(
         host=CLOB_API_URL,
         chain_id=POLYGON_CHAIN_ID,

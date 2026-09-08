@@ -76,10 +76,11 @@ class Settings:
     # externa (MetaMask/Rabby) -- ahí vive el pUSD real, no en la EOA firmante. Sin
     # default: es específico de cada cuenta, no tiene un valor razonable genérico.
     real_funder_address: str | None = os.getenv("REAL_FUNDER_ADDRESS")
-    # POLY_GNOSIS_SAFE=2 por defecto: es el signature_type documentado por Polymarket
-    # para cuentas creadas con wallet externa (ver CLAUDE.md, sección Fase 3, para la
-    # fuente exacta). Configurable por si el tipo de cuenta cambia en el futuro.
-    real_signature_type: int = _int_env("REAL_SIGNATURE_TYPE", 2)
+    # POLY_1271=3 por defecto -- ver CLAUDE.md, sección Fase 3, para por qué esto NO es
+    # POLY_GNOSIS_SAFE=2 pese a que la documentación general de Polymarket asocia "Safe
+    # Wallet"/MetaMask con ese valor: se verificó empíricamente contra el balance real
+    # on-chain de la cuenta y sólo signature_type=3 lo reflejó. Configurable por cuenta.
+    real_signature_type: int = _int_env("REAL_SIGNATURE_TYPE", 3)
 
 
 settings = Settings()

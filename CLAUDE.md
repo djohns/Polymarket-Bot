@@ -624,20 +624,39 @@ de las decisiones no obvias:
   (cómo se firma la orden en relación a esa dirección). Sin ellos, el cliente
   asume por defecto `signature_type=EOA` y `funder=<la misma EOA firmante>` —
   válido sólo para cuentas sin proxy wallet.
-  - **Qué `signature_type` corresponde a esta cuenta, y la fuente**: la
+  - **Qué `signature_type` corresponde a esta cuenta — la documentación
+    general no bastó, hubo que verificar contra el balance real**: la
     documentación oficial (docs.polymarket.com/trading/wallets-auth) distingue
     tres tipos de wallet legacy: *Proxy Wallet* — "a legacy smart wallet
     created through Magic Link or Google authentication" (`POLY_PROXY=1`) — y
     *Safe Wallet* — para cuentas que "created [an account wallet] with an
     external signer such as MetaMask or Rabby Wallet" (`POLY_GNOSIS_SAFE=2`).
-    Esta cuenta se conectó con MetaMask, así que corresponde **Safe Wallet /
-    `POLY_GNOSIS_SAFE=2`**, no `POLY_PROXY=1` (ese es específicamente para
-    Magic Link/email, no para wallets externas). El SDK (`SignatureTypeV2` en
-    `py_clob_client_v2/order_utils/model/signature_type_v2.py`) confirma la
-    misma enumeración de valores, pero no dice cuál corresponde a qué método
-    de login — eso sólo está en la documentación de Polymarket, no en el
-    código del cliente, así que hubo que buscarlo ahí en vez de asumir por el
-    nombre del enum.
+    Por esa descripción, la hipótesis inicial fue `POLY_GNOSIS_SAFE=2` (esta
+    cuenta se conectó con MetaMask). **Se probó y `get_balance_allowance`
+    seguía devolviendo `balance: "0"` incluso con `funder` y `signature_type=2`
+    ya bien configurados** — la documentación general no reflejaba el estado
+    real de esta cuenta. Antes de asumir que el problema era otra cosa, se
+    probaron los 4 valores del enum (`SignatureTypeV2`: `EOA=0`, `POLY_PROXY=1`,
+    `POLY_GNOSIS_SAFE=2`, `POLY_1271=3`) contra el `ClobClient` real y se
+    comparó cada respuesta contra el balance real de pUSD ya verificado
+    independientemente on-chain vía RPC ($22.332297 en la proxy wallet,
+    confirmado con `eth_call` directo al contrato de colateral). Sólo
+    **`POLY_1271=3`** devolvió ese mismo número exacto (`"22332297"`, en
+    unidades de 6 decimales) y, además, los 4 allowances ya en
+    `2^256-1` (aprobación infinita, ya seteada de antes — no hizo falta
+    llamar a `update_balance_allowance`). Los otros tres valores (incluido
+    el `2` sugerido por la documentación) dieron balance y allowances en 0.
+    Esto no contradice necesariamente la documentación en general — puede
+    ser que la implementación específica de proxy wallet de esta cuenta (un
+    minimal proxy/clon EIP-1167, confirmado vía `eth_getCode`, que valida
+    firmas por EIP-1271 en vez de ser un Gnosis Safe multisig clásico) caiga
+    bajo una categoría distinta a la que la documentación describe en
+    términos generales para "MetaMask → Safe Wallet". El punto para el
+    futuro: **no asumir el `signature_type` sólo por el método de login
+    documentado — verificarlo siempre contra el balance real on-chain de la
+    cuenta específica**, tal como se hizo acá, antes de dar por buena
+    cualquier configuración de Fase 3 en una VPS nueva o con una wallet
+    distinta.
   - **El SDK no deriva el funder solo**: `OrderBuilder.__init__` lo documenta
     explícitamente ("Address which holds funds... Used for Polymarket proxy
     wallets and other smart contract wallets") y lo toma como parámetro
@@ -648,11 +667,11 @@ de las decisiones no obvias:
   - **Variables nuevas**: `REAL_FUNDER_ADDRESS` (sin default — específica de
     cada cuenta; si no está seteado y `REAL_TRADING_ENABLED=true`, Fase 3 no
     arranca, mismo patrón de gate que el kill-switch) y `REAL_SIGNATURE_TYPE`
-    (default `2`, ver arriba). Ambos se pasan al construir el `ClobClient` en
-    `main.py::_build_real_execution_engine`; de ahí los hereda todo lo demás
-    (`allowances.py`, `real_executor.py`, el loop de balance del kill-switch)
-    sin cambios propios, porque todos operan sobre la misma instancia de
-    cliente.
+    (default `3` = `POLY_1271`, ver arriba por qué). Ambos se pasan al
+    construir el `ClobClient` en `main.py::_build_real_execution_engine`; de
+    ahí los hereda todo lo demás (`allowances.py`, `real_executor.py`, el loop
+    de balance del kill-switch) sin cambios propios, porque todos operan sobre
+    la misma instancia de cliente.
 - **Allowance de COLLATERAL**: se verifica/asegura al arrancar Fase 3 vía
   `get_balance_allowance` / `update_balance_allowance` de py-clob-client-v2
   (`execution/allowances.py`) — el SDK expone esto como llamada de API, no
@@ -707,7 +726,7 @@ de las decisiones no obvias:
   (`data/private_key.enc`), `REAL_KEY_PASSPHRASE_ENV_VAR`
   (`POLYMARKET_KEY_PASSPHRASE`), `REAL_BALANCE_CHECK_INTERVAL_SECONDS` (300),
   `REAL_FUNDER_ADDRESS` (sin default, específica de la cuenta),
-  `REAL_SIGNATURE_TYPE` (2 = `POLY_GNOSIS_SAFE`, ver arriba por qué).
+  `REAL_SIGNATURE_TYPE` (3 = `POLY_1271`, verificado empíricamente, ver arriba).
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
