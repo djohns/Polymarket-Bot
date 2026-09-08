@@ -24,6 +24,7 @@ class MarketInfo:
     fee_exponent: float
     fees_enabled: bool
     cluster_id: str
+    sports_market_type: str | None = None  # ej. "moneyline" -- Gamma lo pone sólo en mercados deportivos
 
 
 def _parse_market(raw: dict) -> MarketInfo | None:
@@ -55,6 +56,7 @@ def _parse_market(raw: dict) -> MarketInfo | None:
         fee_exponent=float(fee_schedule.get("exponent", 1.0)),
         fees_enabled=bool(raw.get("feesEnabled")) and bool(fee_schedule),
         cluster_id=cluster_id,
+        sports_market_type=raw.get("sportsMarketType"),
     )
 
 

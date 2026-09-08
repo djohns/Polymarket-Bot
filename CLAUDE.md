@@ -54,8 +54,12 @@ matan el margen, y cualquier cosa que dependa de velocidad sub-segundo.
   - **Parte 4 (hecha, fuera del plan original de 3 partes)**: exposición del
     dashboard vía nginx en un puerto no estándar con HTTP Basic Auth, para
     verlo sin SCP manual. Ver sección dedicada más abajo.
-- **Fase 3**: vivo con capital mínimo (decenas–cientos de USDC). Ejecución
-  real firmada, kill-switch, wallet con private key cifrada en reposo.
+- **Fase 3 (actual, hecha — pendiente de la primera orden real supervisada)**:
+  vivo con capital mínimo real ($20 USDC), acotado deliberadamente a arb
+  intra-mercado en mercados deportivos (resolución rápida) — todo lo demás
+  sigue en paper trading dentro del mismo proceso. Ejecución real firmada,
+  kill-switch manual+automático, wallet con private key cifrada en reposo.
+  Ver sección dedicada más abajo.
 - **Fase 4**: escalado condicional (drawdown real ≤ 2× simulado).
 
 Cada fase se pide explícitamente desde el chat del proyecto. No adelantar
@@ -81,19 +85,27 @@ src/polybot/
     simulator.py       # Simulador de fills de arb contra el order book real, sin firmar (Fase 2)
     resolution.py       # Consulta de resolución real vía CLOB (Fase 2, parte 2)
     resolution_job.py    # Cierra posiciones resueltas + backfill de Brier (Fase 2, parte 2)
+    eligibility.py       # Filtro "mercado de resolución rápida" (sólo deportes) (Fase 3)
+    key_management.py    # Cifrado/descifrado Fernet de la private key (Fase 3)
+    kill_switch.py        # Kill-switch manual+automático por archivo flag (Fase 3)
+    allowances.py          # Verifica/asegura allowance de COLLATERAL antes de operar (Fase 3)
+    real_executor.py        # Ejecución real: taker en ambas patas, vía py-clob-client-v2 (Fase 3)
   persistence/
     models.py   # Opportunity + SimulatedPosition (Fase 2 p.1) + SignalResolution (Fase 2 p.2)
+                # + RealPosition (Fase 3, capital real -- separada de SimulatedPosition)
     db.py       # Engine/session SQLite
   dashboard/
     snapshot.py  # Agregados SQL -> dataclass Snapshot (Fase 2, parte 3)
     render.py    # Snapshot -> HTML autocontenido (SVG a mano, sin dependencias)
     report.py    # Job puntual: genera y escribe data/dashboard.html a disco
   config.py     # Settings desde .env, URLs de APIs, umbrales de señales
-  main.py       # Runner: ingesta + señales + simulador de ejecución, sin trading real
+  main.py       # Runner: ingesta + señales + simulador de ejecución + ejecución real (Fase 3, sólo si REAL_TRADING_ENABLED=true)
 scripts/
-  test_connection.py   # Prueba de solo lectura Gamma+CLOB (Fase 0)
+  test_connection.py       # Prueba de solo lectura Gamma+CLOB (Fase 0)
+  encrypt_private_key.py    # Setup interactivo: cifra la private key de trading real (Fase 3)
 docs/
   setup.md      # Cómo correr el proyecto
+  deploy.md     # Incluye el procedimiento de passphrase/cifrado de Fase 3
 tests/
 ```
 
@@ -507,6 +519,149 @@ de las decisiones no obvias:
   para tener `htpasswd`). Vive únicamente en `/etc/nginx/.htpasswd` en la
   VPS (permisos 640, `root:nginx`) y se comunicó una vez por chat a quien
   hizo el deploy — no está en el repo ni en `.env`.
+
+## Fase 3 — ejecución real con capital mínimo
+
+- **Alcance deliberadamente acotado a un segmento chico y verificado**: sólo
+  arb intra-mercado en mercados que califican como "resolución rápida"
+  (`execution/eligibility.py::is_fast_resolution_market`). Todo lo demás
+  (horizonte largo, longshot, y cualquier mercado no-deportivo) sigue
+  exclusivamente en paper trading dentro del mismo proceso — el simulador de
+  Fase 2 no se tocó ni se desactivó para nada de eso.
+- **Criterio de "resolución rápida" = deportes, vía el campo `sportsMarketType`
+  de Gamma**: viene poblado (ej. `"moneyline"`) únicamente en mercados
+  deportivos y en ningún otro tipo observado — se agregó como campo directo a
+  `MarketInfo` (`sports_market_type`) en vez de inferir por categoría/tags/NLP,
+  mismo criterio que ya se usó para `feeSchedule` en Fase 1 (preferir el campo
+  que la API ya da en vivo). Es evidencia empírica de las auditorías de Fase 2:
+  los mercados deportivos fueron los únicos con resolución consistente <24h;
+  los de horizonte largo llevaban aún sin resolver ninguno al momento de
+  construir esta fase.
+- **Capital real: $20 USDC.** Tope $5 por mercado y $5 por cluster
+  (`REAL_MAX_EXPOSURE_PER_MARKET_USD` / `REAL_MAX_EXPOSURE_PER_CLUSTER_USD`).
+  `risk/sizing.py::max_capital_for_real_trade` es una función separada de
+  `max_capital_for_arb_trade` (Fase 2): usa límites absolutos en dólares, no
+  fracciones de un capital base ficticio, y además respeta un techo duro sobre
+  la exposición REAL total abierta en todo momento (`REAL_CAPITAL_BASE_USD`),
+  algo que Fase 2 no necesitaba porque su "capital" nunca fue real ni finito.
+  Sigue sin usar Kelly, mismo argumento que en Fase 2: el arb no tiene
+  incertidumbre probabilística que ponderar.
+- **Ejecución taker en ambas patas, no maker (decisión explícita del usuario,
+  tras plantearle el trade-off)**: un basket de arb necesita que YES y NO
+  llenen esencialmente al mismo tiempo. Post-only en ambas patas dejaría leg
+  risk real con dinero real (una pata llena, la otra no, antes de que la
+  oportunidad desaparezca). Se decidió cruzar el spread de inmediato en las
+  dos patas (`OrderType.FOK`, vía `create_and_post_market_order` de
+  py-clob-client-v2 — el SDK calcula el precio marketable caminando el book
+  internamente, no se construye a mano), reusando la misma lógica de
+  profundidad del simulador de Fase 2 (`simulate_arbitrage_fill`, ahora acepta
+  un `max_cost` inyectado en vez de sólo calcularlo, para que Fase 3 reuse
+  exactamente el mismo camino de código de decisión/sizing que Fase 2 en vez
+  de duplicarlo). Con $5 de tope por mercado el fee taker es marginal
+  comparado con el riesgo de quedar con una sola pata abierta.
+- **Leg risk residual — reconocido, no eliminado**: incluso con ambas patas
+  taker, son dos llamadas HTTP separadas; no hay forma de que el exchange las
+  ejecute atómicamente. Si la pata YES llena y la pata NO falla o no llena
+  (`FOK` no matchea), el sistema trata esto como evento de emergencia:
+  dispara el kill-switch automáticamente (no reintenta solo) y persiste la
+  posición desbalanceada en `real_positions` con `status="pendiente"` para
+  revisión manual (`execution/real_executor.py::_handle_leg_imbalance`). No
+  hay lógica de "deshacer" la pata YES (venderla de vuelta) — se consideró
+  fuera de alcance de esta fase; la posición desbalanceada queda para que el
+  usuario decida qué hacer con ella.
+- **Kill-switch manual: un archivo flag en disco**
+  (`REAL_KILL_SWITCH_FLAG_PATH`, default `data/REAL_TRADING_HALTED`), no una
+  variable de entorno. El proceso corre 24/7 bajo systemd; una env var
+  requeriría reiniciar el servicio para cambiarla, y el usuario necesita poder
+  detener/reanudar el trading real sin matar el proceso (que seguiría
+  haciendo paper trading normal para todo lo demás). Su sola presencia
+  bloquea el envío de cualquier orden real, verificado en el primer paso de
+  `RealExecutionEngine.maybe_execute` y también antes de construir el motor al
+  arrancar (`main.py::_build_real_execution_engine`).
+- **Kill-switch automático por drawdown**: si el balance real de USDC cae bajo
+  $15 (`REAL_KILL_SWITCH_BALANCE_FLOOR_USD`, 25% de drawdown sobre $20 base),
+  se activa escribiendo el mismo archivo flag que el manual — no hay un
+  mecanismo separado. Se verifica en un loop propio e independiente
+  (`main.py::real_balance_kill_switch_loop`, cada
+  `REAL_BALANCE_CHECK_INTERVAL_SECONDS`, default 300s), consultando el
+  balance real vía `get_balance_allowance` del cliente CLOB. Una vez que
+  dispara, el sistema NO reintenta operar solo — el archivo persiste en disco
+  entre reinicios del proceso, así que un reinicio del servicio no reactiva el
+  trading real por accidente. Reactivar requiere borrar el archivo a mano
+  (ver docs/deploy.md) después de entender la causa.
+- **Cifrado de la private key en reposo**: Fernet (`cryptography`) con la
+  clave derivada en cada arranque vía PBKDF2-HMAC-SHA256 (600k iteraciones)
+  a partir de una passphrase que el usuario genera y gestiona fuera del
+  repo/VPS. El salt de derivación no es secreto (viaja en texto plano junto al
+  archivo cifrado) — su único rol es que la misma passphrase no produzca
+  siempre la misma clave derivada. La passphrase se lee en runtime desde
+  `POLYMARKET_KEY_PASSPHRASE` (`REAL_KEY_PASSPHRASE_ENV_VAR`), una variable
+  separada del `.env` principal que el usuario exporta a mano antes de
+  arrancar el servicio — nunca queda persistida en disco sin cifrar. La key
+  descifrada sólo existe en memoria del proceso vivo
+  (`execution/key_management.py::load_private_key`); no se loguea ni se
+  vuelve a escribir a disco en ningún punto. Procedimiento exacto paso a paso
+  (generación de passphrase, cifrado, exportación, rotación) documentado en
+  docs/deploy.md — pensado para que el usuario lo ejecute solo, sin depender
+  de que se le vuelva a explicar.
+- **`scripts/encrypt_private_key.py` es una herramienta de setup, no se invoca
+  desde el proceso del bot**: usa `getpass` (la private key y la passphrase
+  nunca se pasan como argumento de línea de comandos ni quedan en el
+  historial de shell o en `ps`). El usuario la corre a mano una vez (o cada
+  vez que rota la key/passphrase).
+- **Allowance de COLLATERAL**: se verifica/asegura al arrancar Fase 3 vía
+  `get_balance_allowance` / `update_balance_allowance` de py-clob-client-v2
+  (`execution/allowances.py`) — el SDK expone esto como llamada de API, no
+  hace falta construir una transacción on-chain manual de `setApprovalForAll`.
+  Sólo se gestiona el allowance de COLLATERAL (USDC): la estrategia sólo
+  compra y nunca vende antes de la resolución, así que nunca hace falta
+  transferir tokens condicionales de vuelta al exchange — no se gestiona
+  allowance de CONDITIONAL. Si el allowance sigue en 0 después de intentar
+  actualizarlo, Fase 3 no arranca (se loguea CRITICAL y se aborta el setup, no
+  se reintenta indefinidamente).
+- **`REAL_TRADING_ENABLED` (default false) es el interruptor maestro**: incluso
+  con todo el resto del setup completo (key descifrada, allowances OK,
+  kill-switch en su lugar), si esta variable no está en `true` el motor de
+  ejecución real ni se construye — el proceso sigue funcionando exactamente
+  como en Fase 1/2. Se prendió a mano después de que el usuario confirmó ver
+  el setup completo (allowances, kill-switch probado, cifrado de clave
+  validado) — no se activó de forma automática la primera vez, tal como se
+  pidió explícitamente.
+- **`RealPosition` (tabla `real_positions`) separada de `SimulatedPosition`**:
+  mismo nivel de detalle (costo, fee, P&L esperado, timestamps) más lo que
+  sólo existe para una orden real — `yes_order_id`/`no_order_id` y
+  `yes_tx_hash`/`no_tx_hash` de cada pata. `realized_pnl` queda sin usar por
+  ahora (nunca se marca "cerrada" automáticamente) — el job de resolución de
+  Fase 2 (`resolution_job.py`) sigue operando exclusivamente sobre
+  `SimulatedPosition`; extenderlo a `RealPosition` es trabajo pendiente, no
+  pedido en esta sesión (mismo principio de "no adelantar fases/partes no
+  pedidas" que ya se siguió en Fase 2).
+- **Verificación de fill vía `transactionsHashes` en la respuesta de
+  `post_order`/`create_and_post_market_order`**: heurística conservadora
+  (`execution/real_executor.py::_order_filled`) documentada como pendiente de
+  validar contra la respuesta real de la API la primera vez que se opere de
+  verdad — no había forma de confirmarla sin credenciales de trading en esta
+  sesión. Si el formato real difiere, es lo primero a ajustar durante el setup
+  supervisado antes de la primera orden.
+- **Latencia aceptada, no resuelta**: la ejecución real (llamadas HTTP
+  síncronas de py-clob-client-v2) corre dentro del mismo callback síncrono
+  `SignalEngine._check_arbitrage` que ya hacía las escrituras SQLite de Fase
+  1/2 — no se convirtió a async como sí se hizo con el job de resolución de
+  Fase 2 parte 2 (que si necesitaba `httpx.AsyncClient` para no bloquear el
+  heartbeat del WS). El heartbeat del WS corre en una tarea separada y no se
+  ve afectado, pero el procesamiento de mensajes de book entrantes sí puede
+  demorarse brevemente (típicamente sub-segundo) mientras se envía una orden
+  real. Se aceptó este costo en vez de reestructurar Fase 1/2 a async, dado el
+  volumen bajo esperado de trades reales elegibles (sólo deportes, sólo con
+  arb detectado) y que los topes de capital ($5/mercado) ya acotan el impacto
+  de cualquier decisión tomada con datos levemente desactualizados.
+- **Variables nuevas en `.env`**: `REAL_TRADING_ENABLED` (false),
+  `REAL_CAPITAL_BASE_USD` (20.0), `REAL_MAX_EXPOSURE_PER_MARKET_USD` (5.0),
+  `REAL_MAX_EXPOSURE_PER_CLUSTER_USD` (5.0),
+  `REAL_KILL_SWITCH_BALANCE_FLOOR_USD` (15.0), `REAL_KILL_SWITCH_FLAG_PATH`
+  (`data/REAL_TRADING_HALTED`), `REAL_ENCRYPTED_KEY_PATH`
+  (`data/private_key.enc`), `REAL_KEY_PASSPHRASE_ENV_VAR`
+  (`POLYMARKET_KEY_PASSPHRASE`), `REAL_BALANCE_CHECK_INTERVAL_SECONDS` (300).
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 

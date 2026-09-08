@@ -303,6 +303,132 @@ sudo nginx -t                              # validar sintaxis antes de recargar
 sudo journalctl -u nginx -n 50 --no-pager
 ```
 
+## Fase 3 — capital real: cifrado de la private key y passphrase
+
+Capital real ($20 USDC), sólo arb intra-mercado en mercados deportivos
+(resolución rápida) -- ver CLAUDE.md, sección "Fase 3", para el alcance
+completo y las decisiones de seguridad. Esta sección es el procedimiento
+paso a paso que le toca ejecutar al dueño de la cuenta (no a Claude Code):
+generar la passphrase, cifrar la private key, y arrancar el servicio con
+todo en su lugar.
+
+### 1. Generar la passphrase (una sola vez)
+
+En cualquier máquina de confianza (no hace falta que sea la VPS):
+
+```bash
+openssl rand -base64 32
+```
+
+Guardar el resultado en un gestor de contraseñas propio (1Password, Bitwarden,
+etc.) -- **nunca en el repo, nunca en el `.env`, nunca en un archivo de texto
+en la VPS**. Esta passphrase es la única llave que descifra la private key de
+trading real; si se pierde, hay que rotarla (ver más abajo) generando una
+private key nueva para la wallet.
+
+### 2. Cifrar la private key en la VPS
+
+Con la VPS ya con el repo actualizado (`git pull`) y las dependencias
+instaladas (`pip install -e ".[dev]"`, trae `cryptography`):
+
+```bash
+cd /opt/polymarket-bot
+.venv/bin/python scripts/encrypt_private_key.py
+```
+
+El script pide (con `getpass`, no queda en el historial de shell ni en `ps`):
+1. La private key de la wallet dedicada a Fase 3.
+2. La passphrase generada en el paso 1 (dos veces, para confirmar).
+3. La ruta de salida (default `data/private_key.enc`, coincide con
+   `REAL_ENCRYPTED_KEY_PATH` del `.env`).
+
+Escribe `data/private_key.enc` con permisos `600`. Ese archivo sí puede vivir
+en la VPS (está cifrado) pero nunca se commitea -- ya cae bajo el patrón
+`data/` de `.gitignore`.
+
+### 3. Exportar la passphrase al arrancar el servicio
+
+La passphrase se lee en runtime desde la variable de entorno
+`POLYMARKET_KEY_PASSPHRASE` (configurable vía `REAL_KEY_PASSPHRASE_ENV_VAR`),
+separada del `.env` principal a propósito -- nunca queda persistida en disco
+sin cifrar. Con systemd, esto se resuelve con un *drop-in* de entorno que el
+usuario carga a mano antes de (re)iniciar el servicio, en vez de un
+`Environment=` fijo en el unit file (que sí quedaría en disco en claro):
+
+```bash
+sudo systemd-run --scope --uid=opc --gid=opc \
+  --setenv=POLYMARKET_KEY_PASSPHRASE="<passphrase>" \
+  systemctl --user start polymarket-bot.service
+```
+
+O, más simple para uso manual (no recomendado para systemd de sistema, pero
+válido si se corre el proceso a mano durante el setup/pruebas):
+
+```bash
+export POLYMARKET_KEY_PASSPHRASE="<passphrase>"
+.venv/bin/python -m polybot.main
+```
+
+**No** guardar esta variable en `/etc/environment`, en el unit file de
+systemd, ni en ningún archivo que persista en disco sin cifrar -- se exporta
+en la sesión de shell que arranca el proceso, y se pierde al cerrar esa
+sesión (intencional).
+
+### 4. Activar Fase 3
+
+Con `data/private_key.enc` en su lugar y la passphrase exportada, en el
+`.env`:
+
+```
+REAL_TRADING_ENABLED=true
+```
+
+Al arrancar, el bot descifra la key en memoria, construye el cliente CLOB
+autenticado, verifica el allowance de COLLATERAL (lo actualiza si hace falta)
+y sólo entonces empieza a evaluar oportunidades reales. Si el kill-switch ya
+está activo al arrancar (`data/REAL_TRADING_HALTED` existe), el motor de
+ejecución real ni siquiera se construye -- se loguea y el resto del bot sigue
+en modo Fase 1/2 normal.
+
+**Antes de la primera orden real**: avisar por el chat del proyecto y esperar
+confirmación explícita -- no se activa `REAL_TRADING_ENABLED=true` de forma
+automática la primera vez.
+
+### 5. Kill-switch manual
+
+Para detener el trading real en cualquier momento sin matar el proceso
+(sigue haciendo paper trading normal para todo lo demás):
+
+```bash
+touch /opt/polymarket-bot/data/REAL_TRADING_HALTED
+```
+
+Para reactivar, después de confirmar que la causa de la parada está resuelta:
+
+```bash
+rm /opt/polymarket-bot/data/REAL_TRADING_HALTED
+sudo systemctl restart polymarket-bot.service   # re-exportar la passphrase si el proceso se reinició
+```
+
+El mismo archivo lo crea automáticamente el kill-switch por drawdown (balance
+real bajo $15) -- en ese caso no alcanza con borrarlo sin más: primero hay que
+entender por qué cayó el balance antes de reactivar.
+
+### 6. Rotar la private key o la passphrase
+
+Si se sospecha que la passphrase se filtró, o simplemente por higiene
+periódica:
+
+1. Generar una wallet nueva y transferirle el capital real restante (o
+   generar una passphrase nueva si sólo se quiere rotar eso, reusando la
+   misma wallet).
+2. Volver a correr `scripts/encrypt_private_key.py` con la nueva private
+   key y/o nueva passphrase, sobrescribiendo `data/private_key.enc`.
+3. Actualizar la passphrase exportada (paso 3) y reiniciar el servicio.
+4. Confirmar que el allowance de COLLATERAL sigue vigente para la wallet
+   nueva (el bot lo verifica solo al arrancar, pero conviene confirmarlo a
+   mano la primera vez tras una rotación).
+
 ## Revisar datos acumulados
 
 La base SQLite vive en `/opt/polymarket-bot/data/polybot.db`. Para

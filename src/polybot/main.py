@@ -6,9 +6,14 @@ import datetime as dt
 import logging
 import time
 
+from py_clob_client_v2 import AssetType, BalanceAllowanceParams, ClobClient
 from sqlalchemy import func, select
 
-from polybot.config import settings
+from polybot.config import CLOB_API_URL, POLYGON_CHAIN_ID, settings
+from polybot.execution import kill_switch
+from polybot.execution.allowances import ensure_collateral_allowance
+from polybot.execution.key_management import load_private_key
+from polybot.execution.real_executor import RealExecutionEngine
 from polybot.execution.resolution_job import resolve_open_positions
 from polybot.execution.simulator import simulate_arbitrage_fill
 from polybot.ingestion.gamma_discovery import MarketInfo, fetch_active_markets
@@ -24,8 +29,14 @@ logger = logging.getLogger(__name__)
 
 
 class SignalEngine:
-    def __init__(self, markets: list[MarketInfo], store: OrderBookStore) -> None:
+    def __init__(
+        self,
+        markets: list[MarketInfo],
+        store: OrderBookStore,
+        real_engine: RealExecutionEngine | None = None,
+    ) -> None:
         self._store = store
+        self._real_engine = real_engine
         self._by_token: dict[str, MarketInfo] = {}
         for m in markets:
             self._by_token[m.yes_token_id] = m
@@ -123,6 +134,15 @@ class SignalEngine:
 
             session.commit()
 
+        if self._real_engine is not None:
+            try:
+                self._real_engine.maybe_execute(market, yes_book, no_book)
+            except Exception:
+                logger.exception(
+                    "Fallo inesperado en ejecución real para %s -- no se reintenta este ciclo",
+                    market.question[:60],
+                )
+
     def _check_longshot(self, market, yes_book, no_book) -> None:
         yes_mid = _midpoint(yes_book)
         no_mid = _midpoint(no_book)
@@ -185,9 +205,9 @@ def _midpoint(book) -> float | None:
 
 
 async def _run_ws_session(
-    markets: list[MarketInfo], store: OrderBookStore
+    markets: list[MarketInfo], store: OrderBookStore, real_engine: RealExecutionEngine | None = None
 ) -> asyncio.Task:
-    engine = SignalEngine(markets, store)
+    engine = SignalEngine(markets, store, real_engine)
     asset_ids = [tid for m in markets for tid in (m.yes_token_id, m.no_token_id)]
     ws_client = MarketWebSocketClient(asset_ids, store, engine.on_update)
     logger.info("Sesión WS: %d mercados, %d assets suscritos", len(markets), len(asset_ids))
@@ -214,6 +234,78 @@ async def resolution_loop() -> None:
         await asyncio.sleep(settings.resolution_check_interval_seconds)
 
 
+def _build_real_execution_engine() -> RealExecutionEngine | None:
+    """Construye el cliente CLOB autenticado L2 y el motor de ejecución real
+    (Fase 3). Devuelve None si `REAL_TRADING_ENABLED` no está en true -- el
+    resto del sistema sigue funcionando en modo Fase 1/2 sin cambios.
+
+    La private key sólo existe en memoria de este proceso a partir de acá
+    (ver `execution.key_management`); nunca se loguea ni se vuelve a escribir
+    a disco.
+    """
+    if not settings.real_trading_enabled:
+        logger.info("REAL_TRADING_ENABLED=false -- Fase 3 desactivada, sólo paper trading")
+        return None
+
+    if kill_switch.is_halted():
+        logger.critical(
+            "Kill-switch ya está activo al arrancar (%s) -- no se construye el motor de ejecución real",
+            settings.real_kill_switch_flag_path,
+        )
+        return None
+
+    private_key = load_private_key(settings.real_encrypted_key_path, settings.real_key_passphrase_env_var)
+    creds_ok = all([settings.clob_api_key, settings.clob_api_secret, settings.clob_api_passphrase])
+    from py_clob_client_v2 import ApiCreds
+
+    creds = (
+        ApiCreds(
+            api_key=settings.clob_api_key,
+            api_secret=settings.clob_api_secret,
+            api_passphrase=settings.clob_api_passphrase,
+        )
+        if creds_ok
+        else None
+    )
+    client = ClobClient(host=CLOB_API_URL, chain_id=POLYGON_CHAIN_ID, key=private_key, creds=creds)
+    del private_key  # no queda ninguna otra referencia en este scope
+
+    if creds is None:
+        creds = client.create_or_derive_api_key()
+        client.set_api_creds(creds)
+
+    if not ensure_collateral_allowance(client):
+        logger.critical("Allowance de COLLATERAL no operable -- Fase 3 no arranca")
+        return None
+
+    logger.warning(
+        "FASE 3 ACTIVA: ejecución real habilitada (capital base $%.2f, tope $%.2f/mercado, $%.2f/cluster)",
+        settings.real_capital_base_usd,
+        settings.real_max_exposure_per_market_usd,
+        settings.real_max_exposure_per_cluster_usd,
+    )
+    return RealExecutionEngine(client, get_session)
+
+
+async def real_balance_kill_switch_loop(client) -> None:
+    """Chequeo periódico e independiente del balance real de USDC -- si cae bajo
+    `REAL_KILL_SWITCH_BALANCE_FLOOR_USD`, activa el kill-switch automático (ver
+    `execution.kill_switch`). Corre en el mismo event loop que todo lo demás,
+    pero la llamada HTTP del cliente CLOB no bloquea porque se ejecuta en un
+    executor aparte (`asyncio.to_thread`) -- el SDK es síncrono.
+    """
+    while True:
+        try:
+            balance = await asyncio.to_thread(
+                client.get_balance_allowance, BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            current_balance = float(balance.get("balance", 0) or 0) / 1_000_000  # USDC, 6 decimales
+            kill_switch.check_balance_kill_switch(current_balance)
+        except Exception:
+            logger.exception("Fallo consultando balance real, se reintenta en el próximo ciclo")
+        await asyncio.sleep(settings.real_balance_check_interval_seconds)
+
+
 async def run() -> None:
     init_db()
     store = OrderBookStore()
@@ -223,9 +315,13 @@ async def run() -> None:
         logger.error("No se encontraron mercados binarios activos, abortando.")
         return
 
+    real_engine = _build_real_execution_engine()
+    if real_engine is not None:
+        asyncio.create_task(real_balance_kill_switch_loop(real_engine._client))
+
     logger.info("Arrancando ingesta, arb_threshold=%.3f", settings.arb_threshold)
     current_ids = {m.condition_id for m in markets}
-    ws_task = await _run_ws_session(markets, store)
+    ws_task = await _run_ws_session(markets, store, real_engine)
     asyncio.create_task(resolution_loop())
 
     while True:
@@ -245,7 +341,7 @@ async def run() -> None:
             )
             ws_task.cancel()
             current_ids = new_ids
-            ws_task = await _run_ws_session(new_markets, store)
+            ws_task = await _run_ws_session(new_markets, store, real_engine)
 
             active_asset_ids = {
                 tid for m in new_markets for tid in (m.yes_token_id, m.no_token_id)

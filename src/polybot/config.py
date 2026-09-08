@@ -62,5 +62,16 @@ class Settings:
     # Fase 2: dashboard (reporte HTML estático, regenerado por systemd timer -- no es un server vivo)
     dashboard_output_path: str = os.getenv("DASHBOARD_OUTPUT_PATH", "data/dashboard.html")
 
+    # Fase 3: ejecución real (capital real, sólo arb en mercados de resolución rápida)
+    real_trading_enabled: bool = os.getenv("REAL_TRADING_ENABLED", "false").lower() == "true"
+    real_capital_base_usd: float = _float_env("REAL_CAPITAL_BASE_USD", 20.0)
+    real_max_exposure_per_market_usd: float = _float_env("REAL_MAX_EXPOSURE_PER_MARKET_USD", 5.0)
+    real_max_exposure_per_cluster_usd: float = _float_env("REAL_MAX_EXPOSURE_PER_CLUSTER_USD", 5.0)
+    real_kill_switch_balance_floor_usd: float = _float_env("REAL_KILL_SWITCH_BALANCE_FLOOR_USD", 15.0)
+    real_kill_switch_flag_path: str = os.getenv("REAL_KILL_SWITCH_FLAG_PATH", "data/REAL_TRADING_HALTED")
+    real_encrypted_key_path: str = os.getenv("REAL_ENCRYPTED_KEY_PATH", "data/private_key.enc")
+    real_key_passphrase_env_var: str = os.getenv("REAL_KEY_PASSPHRASE_ENV_VAR", "POLYMARKET_KEY_PASSPHRASE")
+    real_balance_check_interval_seconds: int = _int_env("REAL_BALANCE_CHECK_INTERVAL_SECONDS", 300)
+
 
 settings = Settings()

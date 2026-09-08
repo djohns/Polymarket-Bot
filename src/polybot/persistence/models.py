@@ -80,6 +80,43 @@ class SimulatedPosition(Base):
     book_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
+class RealPosition(Base):
+    """Posición REAL de arbitraje intra-mercado (Fase 3) -- firmada y enviada de
+    verdad vía `execution.real_executor`, separada por completo de
+    `SimulatedPosition` (que sigue corriendo sin cambios para todo lo demás:
+    horizonte largo, longshot, y cualquier mercado que no califique como
+    resolución rápida). Mismo nivel de detalle que la posición simulada más
+    los campos que sólo existen para una orden real: fee efectivamente
+    cobrado por el exchange y los hashes de transacción on-chain de cada pata.
+    """
+
+    __tablename__ = "real_positions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    opened_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.UTC), index=True
+    )
+    market_id: Mapped[str] = mapped_column(String, index=True)
+    cluster_id: Mapped[str] = mapped_column(String, index=True)
+    question: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="abierta", index=True)  # "abierta" | "cerrada" | "pendiente"
+
+    shares: Mapped[float] = mapped_column(Float)
+    yes_price_avg: Mapped[float] = mapped_column(Float)
+    no_price_avg: Mapped[float] = mapped_column(Float)
+    cost_usd: Mapped[float] = mapped_column(Float)
+    fee_paid: Mapped[float] = mapped_column(Float)
+    net_pnl_expected: Mapped[float] = mapped_column(Float)
+    realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    resolved_outcome: Mapped[str | None] = mapped_column(String, nullable=True)
+    resolved_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    yes_order_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    no_order_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    yes_tx_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    no_tx_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
 class SignalResolution(Base):
     """Resolución real de un mercado que tuvo al menos una señal favorito-longshot
     (`Opportunity.signal_type == "longshot_bias"`), para calcular Brier score

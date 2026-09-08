@@ -39,7 +39,14 @@ def simulate_arbitrage_fill(
     no_book: OrderBook,
     market_exposure_usd: float,
     cluster_exposure_usd: float,
+    max_cost: float | None = None,
 ) -> SimulatedFill | None:
+    """Camina el book para estimar (o, si `max_cost` viene de un tope real de Fase 3,
+    dimensionar de verdad) un fill de arb. `max_cost=None` (uso normal de Fase 2) calcula
+    el tope vía `max_capital_for_arb_trade`; Fase 3 (`execution.real_executor`) pasa el
+    tope real (`risk.sizing.max_capital_for_real_trade`) para reusar exactamente esta
+    misma lógica de profundidad en vez de duplicarla.
+    """
     yes_levels = sorted(yes_book.asks.items())
     no_levels = sorted(no_book.asks.items())
     if not yes_levels or not no_levels:
@@ -47,7 +54,8 @@ def simulate_arbitrage_fill(
 
     yes_best, no_best = yes_levels[0][0], no_levels[0][0]
 
-    max_cost = max_capital_for_arb_trade(market_exposure_usd, cluster_exposure_usd)
+    if max_cost is None:
+        max_cost = max_capital_for_arb_trade(market_exposure_usd, cluster_exposure_usd)
     if max_cost <= 0:
         return None
 
