@@ -17,6 +17,20 @@ from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 logger = logging.getLogger(__name__)
 
 
+def _min_allowance(response: dict) -> float:
+    """La respuesta real de `get_balance_allowance` trae `allowances` (plural):
+    un dict `{contract_address: allowance}`, uno por cada contrato del exchange
+    (v1, v2, neg-risk, etc.) -- no un único campo `allowance` (verificado
+    empíricamente en la VPS contra la cuenta real; ver CLAUDE.md, sección
+    Fase 3). Se usa el mínimo de todos: si cualquiera de esos contratos no
+    tiene allowance, una orden que intente pasar por ese exchange fallaría
+    igual, así que "operable" significa que TODOS lo están, no sólo uno."""
+    allowances = response.get("allowances") or {}
+    if not allowances:
+        return 0.0
+    return min(float(v or 0) for v in allowances.values())
+
+
 def ensure_collateral_allowance(client) -> bool:
     """Verifica el allowance de COLLATERAL y lo actualiza si hace falta.
 
@@ -28,16 +42,16 @@ def ensure_collateral_allowance(client) -> bool:
     """
     params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
     current = client.get_balance_allowance(params)
-    allowance = float(current.get("allowance", 0) or 0)
+    allowance = _min_allowance(current)
 
     if allowance > 0:
-        logger.info("Allowance de COLLATERAL ya está seteado (%.4f)", allowance)
+        logger.info("Allowance de COLLATERAL ya está seteado (mínimo entre contratos: %.4g)", allowance)
         return True
 
     logger.warning("Allowance de COLLATERAL en 0 -- intentando actualizar vía update_balance_allowance")
     client.update_balance_allowance(params)
     refreshed = client.get_balance_allowance(params)
-    refreshed_allowance = float(refreshed.get("allowance", 0) or 0)
+    refreshed_allowance = _min_allowance(refreshed)
 
     if refreshed_allowance <= 0:
         logger.critical(
@@ -46,5 +60,5 @@ def ensure_collateral_allowance(client) -> bool:
         )
         return False
 
-    logger.info("Allowance de COLLATERAL actualizado a %.4f", refreshed_allowance)
+    logger.info("Allowance de COLLATERAL actualizado a %.4g", refreshed_allowance)
     return True

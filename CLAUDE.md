@@ -682,6 +682,18 @@ de las decisiones no obvias:
   allowance de CONDITIONAL. Si el allowance sigue en 0 después de intentar
   actualizarlo, Fase 3 no arranca (se loguea CRITICAL y se aborta el setup, no
   se reintenta indefinidamente).
+  - **Bug real encontrado y corregido durante la verificación con balance ya
+    correcto**: el código original asumía un campo `allowance` (singular) en
+    la respuesta de `get_balance_allowance`, pero la forma real es
+    `allowances` (plural) — un dict `{contrato: allowance}`, uno por cada
+    exchange (v1, v2, neg-risk). Con la cuenta ya mostrando balance correcto
+    ($22.33) y los 4 allowances ya en `2^256-1` (aprobación infinita, seteada
+    de antes), `ensure_collateral_allowance` seguía devolviendo `False` — el
+    `.get("allowance", 0)` nunca encontraba ese campo y siempre leía 0. Fix en
+    `execution/allowances.py::_min_allowance`: toma el mínimo entre todos los
+    contratos del dict `allowances` (si cualquiera de ellos está en 0, una
+    orden que pase por ese exchange fallaría igual). Cubierto con tests en
+    `tests/test_execution_allowances.py` (no existían antes de este bug).
 - **`REAL_TRADING_ENABLED` (default false) es el interruptor maestro**: incluso
   con todo el resto del setup completo (key descifrada, allowances OK,
   kill-switch en su lugar), si esta variable no está en `true` el motor de
