@@ -883,18 +883,22 @@ hasta que alguien lo entienda es el comportamiento correcto.
 Las 4 posiciones del incidente se registraron a mano en `real_positions`
 (`scripts/backfill_incident_2026_09_08.py`, ya ejecutado en la VPS, se deja
 en el repo como referencia/auditoría, no pensado para volver a correrse).
-`cost_usd` es exacto (tomado directo de los eventos `Transfer` de pUSD
-on-chain); `shares`/`yes_price_avg` son estimados a partir del
-`simulated_position` más cercano en el tiempo para el mismo mercado (mismo
-book, mismo precio observado), no un valor confirmado por el exchange -- cada
-fila lo deja explícito en `notes`. **Nota post-validación**: al confirmar el
-punto 1 de abajo se encontraron los `taker_order_id` reales de las 4 órdenes
-vía `get_trades`, con precio/tamaño exactos del exchange (ej. Aston Villa FC
-fue price=0.48 size=6.125, no el 0.56/5.25 estimado acá) -- quedó pendiente
-si vale la pena corregir estas 4 filas con esos valores más precisos; no se
-hizo en esta sesión para no introducir más aproximación sobre el componente
-de fee, que sigue sin poder reconciliarse con precisión contra el monto
-exacto transferido on-chain.
+`cost_usd` es exacto desde el principio (tomado directo de los eventos
+`Transfer` de pUSD on-chain). `yes_price_avg`/`shares` se estimaron
+inicialmente contra el `simulated_position` más cercano en el tiempo, y se
+**corrigieron a los valores exactos** una vez identificados los
+`taker_order_id` reales durante la validación de `_confirm_via_trades`
+(punto 1 de abajo): `get_trades(maker_address=<funder>)` expuso `price`/`size`
+directo del exchange para las 4. Cambio material en 2 de las 4 -- Aston Villa
+FC pasó de 0.56/5.25 estimado a **0.48/6.125 real** (`realized_pnl` de
+$2.2336 a $3.1086) y AEK de 5.174 a **5.146063** shares (`realized_pnl` de
+$0.5692 a $0.5409); FC Seoul y Club Brugge KV cambiaron de precio/shares pero
+su `realized_pnl` no varió (pérdida total, no depende del tamaño exacto).
+`cost_usd` no se tocó: sigue siendo el monto exacto transferido on-chain,
+que no coincide exactamente con `price × size` del trade (la diferencia,
+un par de centavos por posición, es probablemente fee de esa pata --
+no se pudo reconciliar con certeza y no afecta el balance real observado,
+que es lo que finalmente importa). Cada fila registra el cambio en `notes`.
 
 ### Punto 1 validado contra el servidor real -- `_confirm_via_order_status` no servía, `_confirm_via_trades` sí
 
