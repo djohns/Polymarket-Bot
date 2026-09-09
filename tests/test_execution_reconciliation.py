@@ -120,3 +120,27 @@ def test_divergence_beyond_threshold_halts_and_logs(tmp_path):
             triggered = reconciliation.check_balance_reconciliation(session, 11.46)
         assert triggered is True
         assert kill_switch.is_halted(str(flag)) is True
+
+
+def test_resolved_position_via_job_does_not_cause_false_divergence(tmp_path):
+    """Reproduce el escenario del 2026-09-09: una posición real que resuelve y
+    se redime on-chain no debe seguir contando como "comprometida" una vez
+    que el job de resolución la marca "cerrada" -- si el job hizo su trabajo,
+    la reconciliación no debe dispararse."""
+    session_factory = _session_factory()
+    flag = tmp_path / "HALT"
+    with _override(real_capital_base_usd=20.0, real_reconciliation_threshold_usd=0.50, real_kill_switch_flag_path=str(flag)):
+        with session_factory() as session:
+            session.add(
+                RealPosition(
+                    market_id="0xa", cluster_id="c1", question="q", status="cerrada",
+                    shares=10, yes_price_avg=0.4, no_price_avg=0.5, cost_usd=5.0,
+                    fee_paid=0.1, net_pnl_expected=0.2, realized_pnl=0.06,
+                    resolved_outcome="NO", resolved_at=None,
+                )
+            )
+            session.commit()
+            # capital base 20 - 0 comprometido (ya cerrada) + 0.06 realizado = 20.06
+            triggered = reconciliation.check_balance_reconciliation(session, 20.06)
+        assert triggered is False
+        assert not flag.exists()

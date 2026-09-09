@@ -14,6 +14,7 @@ from polybot.execution import kill_switch, reconciliation
 from polybot.execution.allowances import ensure_collateral_allowance
 from polybot.execution.key_management import load_private_key
 from polybot.execution.real_executor import RealExecutionEngine
+from polybot.execution.real_resolution_job import resolve_open_real_positions
 from polybot.execution.resolution_job import resolve_open_positions
 from polybot.execution.simulator import simulate_arbitrage_fill
 from polybot.ingestion.gamma_discovery import MarketInfo, fetch_active_markets
@@ -222,6 +223,12 @@ async def resolution_loop() -> None:
     longshot. Corre en el mismo event loop que la ingesta WS, pero sin bloquearla:
     la consulta HTTP es async (`httpx.AsyncClient`), así que cede el control en cada
     `await` en vez de trabar el heartbeat/reconexión del WebSocket.
+
+    También resuelve `RealPosition` (Fase 3, agregado tras el incidente del
+    2026-09-09: sin esto, una posición real que resolvía y se redimía on-chain
+    quedaba `"abierta"` para siempre, y la reconciliación automática disparaba
+    el kill-switch comparando contra ese estado ya desactualizado). Mismo ciclo,
+    misma sesión -- no hace falta un loop aparte.
     """
     stale_after = dt.timedelta(days=settings.resolution_stale_after_days)
     warned_stale: set[int] = set()
@@ -229,6 +236,7 @@ async def resolution_loop() -> None:
         try:
             with get_session() as session:
                 await resolve_open_positions(session, stale_after=stale_after, warned_stale=warned_stale)
+                await resolve_open_real_positions(session)
         except Exception:
             logger.exception("Fallo en el ciclo de resolución de mercados, se reintenta en el próximo ciclo")
         await asyncio.sleep(settings.resolution_check_interval_seconds)

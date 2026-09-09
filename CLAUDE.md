@@ -90,6 +90,9 @@ src/polybot/
     kill_switch.py        # Kill-switch manual+automático por archivo flag (Fase 3)
     allowances.py          # Verifica/asegura allowance de COLLATERAL antes de operar (Fase 3)
     real_executor.py        # Ejecución real: taker en ambas patas, vía py-clob-client-v2 (Fase 3)
+    real_resolution_job.py    # Cierra RealPosition al resolver, mismo patrón que resolution_job.py (Fase 3)
+    event_log.py                # Persiste eventos críticos de ejecución real en la DB, no sólo journald (Fase 3)
+    reconciliation.py             # Compara balance real vs. real_positions, kill-switch preventivo (Fase 3)
   persistence/
     models.py   # Opportunity + SimulatedPosition (Fase 2 p.1) + SignalResolution (Fase 2 p.2)
                 # + RealPosition (Fase 3, capital real -- separada de SimulatedPosition)
@@ -933,12 +936,79 @@ filtrado por `taker_order_id` (validado contra el servidor real), (3)
 anterior es inconcluso, asumir llenada -- la corrección central del
 incidente, ya no depende de que (2)/(3) funcionen para seguir siendo segura.
 
+### Primera ejecución real post-fix (2026-09-08 23:30 UTC) — éxito completo
+
+Con las 4 correcciones desplegadas, se reactivó `REAL_TRADING_ENABLED` y la
+primera oportunidad real detectada ("Will Independiente Santa Fe win on
+2026-09-08?") se ejecutó de punta a punta correctamente: `EJECUCIÓN REAL` →
+`Orden YES real llenó... enviando pata NO` (confirmado vía `_confirm_via_trades`,
+no `transactionsHashes` -- validando la corrección #1 en un caso real, no sólo
+en el test) → `Posición real abierta | cost_usd=5.00`. Ambas patas cubiertas,
+tope de $5 respetado, todo registrado en `real_positions` +
+`real_execution_events`. A diferencia del incidente original, esta vez el
+sistema hizo exactamente lo que se diseñó para hacer.
+
+### Divergencia de reconciliación del 2026-09-09 — causa benigna, hueco real cerrado
+
+~2.5h después de abrirse, la posición de Independiente Santa Fe resolvió y se
+redimió on-chain (confirmado con certeza vía
+`ConditionalTokens.payoutDenominator`/`payoutNumerators` -- ganó "No" -- y
+`balanceOf` en 0 para ambos tokens condicionales en la proxy wallet), pero
+`RealPosition` no tenía ningún job que se enterara de esto y la siguiera
+marcando `"abierta"`. La reconciliación automática (ya anda cada 5 min, ver
+arriba) comparó el balance real (ya de vuelta en ~$22.73) contra lo que
+`real_positions` todavía decía que estaba comprometido (~$17.73, con los $5
+de esa posición contados como "afuera") y disparó el kill-switch
+correctamente -- la causa de fondo era benigna (dinero real que ya había
+vuelto), pero el sistema no tenía forma de saberlo sin este job, así que
+detener el trading real ante la duda fue el comportamiento correcto.
+
+- **Nuevo job: `execution/real_resolution_job.py::resolve_open_real_positions`**,
+  mismo patrón que `resolution_job.py` para `SimulatedPosition` (Fase 2, parte
+  2) -- mismo `fetch_market_resolution()` de CLOB, mismo `main.py::resolution_loop`
+  (se le agregó esta llamada, no un loop nuevo). Dos tipos de payout al
+  resolver, según el estado de la posición:
+  - `status="abierta"` (ambas patas llenaron -- basket completo): payout
+    garantizado de $1/share sin importar el resultado, `realized =
+    shares - cost_usd - fee_paid` -- idéntico a `SimulatedPosition`.
+  - `status="pendiente"` (leg imbalance -- sólo YES tiene capital real):
+    el payout depende del resultado real: `shares - cost_usd` si ganó YES,
+    `-cost_usd` (pérdida total) si no.
+  No hace verificación on-chain propia (mismo límite ya documentado para
+  `SimulatedPosition`, "The Ghosts of Polymarket") -- para la posición de
+  Santa Fe específicamente, el CLOB REST (`closed`) todavía no reflejaba la
+  resolución al momento de escribir esto pese a que el oráculo on-chain ya
+  la había resuelto -- se cerró esa fila a mano con los valores confirmados
+  on-chain (ver abajo), no vía el job automático. El job seguirá sirviendo
+  para las próximas posiciones una vez que CLOB REST se ponga al día, que es
+  la fuente que ya se usa en todo el resto del proyecto.
+- **La reconciliación (`reconciliation.py::expected_balance_usd`) ya excluía
+  correctamente las posiciones `"cerrada"` del "comprometido"** (sólo cuenta
+  `"enviada"`/`"abierta"`/`"pendiente"`, y suma `realized_pnl` de las
+  `"cerrada"` por separado) -- no hizo falta ningún cambio ahí, sólo que
+  `RealPosition` tuviera un job que efectivamente marcara `"cerrada"` cuando
+  correspondía. Confirmado con un test dedicado
+  (`test_resolved_position_via_job_does_not_cause_false_divergence`).
+- **La posición de Santa Fe se cerró manualmente** (no vía el job, por el
+  desfasaje de CLOB REST explicado arriba) usando certeza on-chain, no
+  inferencia: `payoutDenominator=1` (condición resuelta), `payoutNumerators=[0,1]`
+  (ganó "No"), balance CTF de ambos tokens en 0 (ya redimido). `realized_pnl`
+  se calculó con el flujo de caja real on-chain (-$0.0024: salieron $5.0813 al
+  abrir, entraron $5.0789 al redimir) en vez de la fórmula
+  `shares-cost_usd-fee_paid` (que hubiera dado +$0.0594) -- el costo real de
+  ejecución no coincidió exactamente con la estimación pre-trade. Verificado:
+  con esta fila en `"cerrada"`, `expected_balance_usd` da $22.725094 contra un
+  balance real on-chain de $22.725191 -- la divergencia desaparece sin tocar
+  el checkpoint, exactamente como se pidió confirmar.
+- **Variables**: ninguna nueva -- el job reusa `RESOLUTION_CHECK_INTERVAL_SECONDS`
+  ya existente.
+
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
   puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
-  explícita del usuario.
+  explícita del usuario. Esta sería la tercera activación.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
