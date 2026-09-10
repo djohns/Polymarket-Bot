@@ -30,14 +30,24 @@ def _override(**kwargs):
 
 
 def test_expected_balance_with_no_positions_equals_capital_base():
+    """Fuerza checkpoint=None explícitamente -- sin esto, un `.env` real con
+    REAL_BALANCE_CHECKPOINT_USD ya seteado (como el de producción en la VPS)
+    se filtra al singleton `settings` y hace que este test tome la rama de
+    checkpoint en vez de la nominal que pretende ejercitar."""
     session_factory = _session_factory()
-    with _override(real_capital_base_usd=20.0), session_factory() as session:
+    with (
+        _override(real_capital_base_usd=20.0, real_balance_checkpoint_usd=None, real_balance_checkpoint_at=None),
+        session_factory() as session,
+    ):
         assert reconciliation.expected_balance_usd(session) == 20.0
 
 
 def test_expected_balance_subtracts_committed_capital():
     session_factory = _session_factory()
-    with _override(real_capital_base_usd=20.0), session_factory() as session:
+    with (
+        _override(real_capital_base_usd=20.0, real_balance_checkpoint_usd=None, real_balance_checkpoint_at=None),
+        session_factory() as session,
+    ):
         session.add(
             RealPosition(
                 market_id="0xa", cluster_id="c1", question="q", status="abierta",
@@ -51,7 +61,10 @@ def test_expected_balance_subtracts_committed_capital():
 
 def test_expected_balance_adds_back_realized_pnl_of_closed_positions():
     session_factory = _session_factory()
-    with _override(real_capital_base_usd=20.0), session_factory() as session:
+    with (
+        _override(real_capital_base_usd=20.0, real_balance_checkpoint_usd=None, real_balance_checkpoint_at=None),
+        session_factory() as session,
+    ):
         session.add(
             RealPosition(
                 market_id="0xa", cluster_id="c1", question="q", status="cerrada",
@@ -105,7 +118,13 @@ def test_checkpoint_counts_positions_opened_after_it():
 def test_no_divergence_within_threshold_is_a_noop(tmp_path):
     session_factory = _session_factory()
     flag = tmp_path / "HALT"
-    with _override(real_capital_base_usd=20.0, real_reconciliation_threshold_usd=0.50, real_kill_switch_flag_path=str(flag)):
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
         with session_factory() as session:
             triggered = reconciliation.check_balance_reconciliation(session, 20.30)
         assert triggered is False
@@ -115,7 +134,13 @@ def test_no_divergence_within_threshold_is_a_noop(tmp_path):
 def test_divergence_beyond_threshold_halts_and_logs(tmp_path):
     session_factory = _session_factory()
     flag = tmp_path / "HALT"
-    with _override(real_capital_base_usd=20.0, real_reconciliation_threshold_usd=0.50, real_kill_switch_flag_path=str(flag)):
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
         with session_factory() as session:
             triggered = reconciliation.check_balance_reconciliation(session, 11.46)
         assert triggered is True
@@ -129,7 +154,13 @@ def test_resolved_position_via_job_does_not_cause_false_divergence(tmp_path):
     la reconciliación no debe dispararse."""
     session_factory = _session_factory()
     flag = tmp_path / "HALT"
-    with _override(real_capital_base_usd=20.0, real_reconciliation_threshold_usd=0.50, real_kill_switch_flag_path=str(flag)):
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
         with session_factory() as session:
             session.add(
                 RealPosition(
