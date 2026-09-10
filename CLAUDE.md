@@ -1003,12 +1003,67 @@ detener el trading real ante la duda fue el comportamiento correcto.
 - **Variables**: ninguna nueva -- el job reusa `RESOLUTION_CHECK_INTERVAL_SECONDS`
   ya existente.
 
+### Tercera activación (2026-09-09) — 2 trades reales correctos, luego falso positivo del kill-switch de drawdown
+
+Con las 4 correcciones y el job de resolución de `RealPosition` ya en
+producción, la 3ra activación ejecutó 2 arbs reales de punta a punta sin
+ningún problema: HJK Helsinki (`realized_pnl=+$0.1499`) y FC Barcelona vs.
+Feyenoord BTTS (`realized_pnl=+$0.0269`), ambos cerrados automáticamente por
+`real_resolution_job.py` **sin intervención manual** -- a diferencia del caso
+Santa Fe (2026-09-08), que sí había necesitado un cierre a mano. Es la
+primera confirmación de que esa corrección funciona sola en producción, no
+sólo en tests.
+
+Sin embargo, ~1 minuto después de abrir la segunda posición (2 posiciones
+reales de $5 abiertas a la vez), el kill-switch automático de drawdown se
+disparó: `balance real $12.54 por debajo del piso $15.00`. El trading real
+quedó detenido **7.5 horas sin causa real** hasta que una auditoría (pedida
+explícitamente en modo solo-lectura) lo detectó.
+
+**Causa raíz -- confusión entre "balance líquido" y "equity"**:
+`check_balance_kill_switch` comparaba el balance líquido crudo de la wallet
+contra el piso de $15, pero ese balance baja por diseño cada vez que hay una
+posición real abierta (el capital sigue existiendo, sólo está temporalmente
+fuera de la wallet hasta que la posición resuelve) -- no es una pérdida.
+Con capital real de ~$22.33 y tope de $5/mercado, bastaba con 2 posiciones
+concurrentes ($10 comprometidos) para cruzar el piso de $15 sin ninguna
+pérdida real. La reconciliación (que si sabe distinguir "comprometido" de
+"perdido", ver `expected_balance_usd`) no se vio afectada por este bug -- de
+hecho generó 2 divergencias transitorias por el mismo motivo de siempre
+(lag entre resolución on-chain y CLOB REST) que se autoresolvieron solas
+cuando el job de resolución cerró ambas posiciones, sin necesitar el fix de
+abajo.
+
+**Fix -- el piso de drawdown ahora evalúa equity, no balance líquido**:
+`kill_switch.py::check_balance_kill_switch` calcula
+`equity = balance_líquido + committed_capital_usd(session)`, donde
+`committed_capital_usd` suma `cost_usd` de todas las `RealPosition` en
+`"enviada"`/`"abierta"`/`"pendiente"` -- y compara *eso* contra el piso. La
+función ahora requiere `session` (antes era opcional; el único caller en
+producción, `main.py::real_balance_kill_switch_loop`, ya lo pasaba siempre).
+Cubierto con
+`tests/test_execution_kill_switch.py::test_two_concurrent_open_positions_do_not_trigger_false_positive`
+(reproduce exactamente el escenario del 2026-09-09: balance líquido $12.54 +
+2×$5 comprometido = equity $22.54, no dispara) y
+`test_real_drawdown_with_open_positions_still_triggers` (una pérdida real
+genuina con posiciones abiertas sigue disparando: balance $8.00 + $5.00
+comprometido = equity $13.00, bajo el piso).
+
+**Piso de drawdown vs. reconciliación -- documentado como dos mecanismos
+separados** (ver también el docstring de `kill_switch.py`): el piso evalúa
+"¿se perdió plata de verdad?" (equity vs. un umbral fijo); la reconciliación
+evalúa "¿el balance real coincide con lo que la DB dice que debería haber?"
+(cualquier divergencia, no sólo hacia abajo). Comparten el mismo archivo
+flag para detener el trading, pero no se fusionan en una sola función --
+resuelven preguntas distintas y mezclarlas habría ocultado cuál de las dos
+disparó en cada caso.
+
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
   puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
-  explícita del usuario. Esta sería la tercera activación.
+  explícita del usuario. Esta sería la cuarta activación.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 

@@ -2,7 +2,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from polybot.execution import kill_switch
-from polybot.persistence.models import Base, RealExecutionEvent
+from polybot.persistence.models import Base, RealExecutionEvent, RealPosition
 
 
 def _session_factory():
@@ -32,13 +32,17 @@ def test_halt_is_idempotent_does_not_overwrite(tmp_path):
 
 
 def test_check_balance_kill_switch_triggers_below_floor(tmp_path):
+    """Sin ninguna posición real en curso, equity == balance líquido -- una
+    pérdida real genuina (equity bajo el piso) sí debe disparar el kill-switch."""
     from polybot.config import settings
 
     flag = tmp_path / "HALT"
+    session_factory = _session_factory()
     old = settings.real_kill_switch_balance_floor_usd
     object.__setattr__(settings, "real_kill_switch_balance_floor_usd", 15.0)
     try:
-        assert kill_switch.check_balance_kill_switch(10.0, str(flag)) is True
+        with session_factory() as session:
+            assert kill_switch.check_balance_kill_switch(10.0, session, str(flag)) is True
         assert flag.exists()
     finally:
         object.__setattr__(settings, "real_kill_switch_balance_floor_usd", old)
@@ -76,10 +80,74 @@ def test_check_balance_kill_switch_ok_above_floor(tmp_path):
     from polybot.config import settings
 
     flag = tmp_path / "HALT"
+    session_factory = _session_factory()
     old = settings.real_kill_switch_balance_floor_usd
     object.__setattr__(settings, "real_kill_switch_balance_floor_usd", 15.0)
     try:
-        assert kill_switch.check_balance_kill_switch(20.0, str(flag)) is False
+        with session_factory() as session:
+            assert kill_switch.check_balance_kill_switch(20.0, session, str(flag)) is False
         assert not flag.exists()
+    finally:
+        object.__setattr__(settings, "real_kill_switch_balance_floor_usd", old)
+
+
+def test_two_concurrent_open_positions_do_not_trigger_false_positive(tmp_path):
+    """Reproduce exactamente el falso positivo del 2026-09-09: 2 posiciones
+    reales de $5 abiertas a la vez bajan el balance líquido a $12.54 (bajo el
+    piso de $15), pero el capital sigue existiendo (comprometido, no perdido)
+    -- equity = 12.54 + 5.00 + 5.00 = 22.54, muy por encima del piso. El
+    kill-switch NO debe dispararse."""
+    from polybot.config import settings
+
+    flag = tmp_path / "HALT"
+    session_factory = _session_factory()
+    old = settings.real_kill_switch_balance_floor_usd
+    object.__setattr__(settings, "real_kill_switch_balance_floor_usd", 15.0)
+    try:
+        with session_factory() as session:
+            session.add_all(
+                [
+                    RealPosition(
+                        market_id="0xa", cluster_id="c1", question="q1", status="abierta",
+                        shares=5.26, yes_price_avg=0.3, no_price_avg=0.6, cost_usd=5.0,
+                        fee_paid=0.05, net_pnl_expected=0.15,
+                    ),
+                    RealPosition(
+                        market_id="0xb", cluster_id="c2", question="q2", status="abierta",
+                        shares=5.15, yes_price_avg=0.5, no_price_avg=0.4, cost_usd=5.0,
+                        fee_paid=0.05, net_pnl_expected=0.03,
+                    ),
+                ]
+            )
+            session.commit()
+            assert kill_switch.check_balance_kill_switch(12.54, session, str(flag)) is False
+        assert not flag.exists()
+    finally:
+        object.__setattr__(settings, "real_kill_switch_balance_floor_usd", old)
+
+
+def test_real_drawdown_with_open_positions_still_triggers(tmp_path):
+    """Si además de tener posiciones abiertas hay una pérdida real genuina
+    (equity total bajo el piso, no sólo balance líquido bajo por posiciones
+    en curso), el kill-switch sí debe dispararse."""
+    from polybot.config import settings
+
+    flag = tmp_path / "HALT"
+    session_factory = _session_factory()
+    old = settings.real_kill_switch_balance_floor_usd
+    object.__setattr__(settings, "real_kill_switch_balance_floor_usd", 15.0)
+    try:
+        with session_factory() as session:
+            session.add(
+                RealPosition(
+                    market_id="0xa", cluster_id="c1", question="q1", status="abierta",
+                    shares=5.0, yes_price_avg=0.3, no_price_avg=0.6, cost_usd=5.0,
+                    fee_paid=0.05, net_pnl_expected=0.15,
+                )
+            )
+            session.commit()
+            # balance líquido $8.00 + comprometido $5.00 = equity $13.00, bajo el piso de $15
+            assert kill_switch.check_balance_kill_switch(8.00, session, str(flag)) is True
+        assert flag.exists()
     finally:
         object.__setattr__(settings, "real_kill_switch_balance_floor_usd", old)

@@ -16,6 +16,25 @@ NO debe reintentar operar solo; requiere que el usuario borre el archivo a
 mano para reactivar, tal como se le pidió explícitamente. El archivo persiste
 entre reinicios del proceso (vive en disco, no en memoria), así que un
 reinicio del servicio no reactiva el trading real por accidente.
+
+**Piso de drawdown vs. reconciliación -- dos mecanismos distintos, no
+confundirlos** (aclarado tras el falso positivo del 2026-09-09, ver
+CLAUDE.md, sección Fase 3):
+- `check_balance_kill_switch` (acá abajo) evalúa **equity** (balance líquido
+  + capital comprometido en posiciones reales en curso) contra un piso fijo
+  -- responde "¿el bot perdió plata de verdad?". Antes de esta corrección
+  comparaba el balance líquido crudo, que baja simplemente por tener
+  posiciones reales abiertas (dinero temporalmente fuera de la wallet, no
+  perdido) -- con 2+ posiciones de $5 abiertas a la vez sobre $20-22 de
+  capital, esto bastaba para disparar el piso de $15 sin ninguna pérdida
+  real (7.5h de trading real detenido sin causa genuina el 2026-09-09).
+- `execution.reconciliation.check_balance_reconciliation` evalúa si el
+  balance líquido real coincide con lo que `real_positions` dice que
+  debería haber -- responde "¿hay una orden real que se ejecutó y no quedó
+  registrada?". No mira ningún piso; cualquier divergencia (positiva o
+  negativa) más allá del umbral de tolerancia es sospechosa.
+Ambos pueden activar el mismo archivo flag (mismo mecanismo de parada), pero
+preguntan cosas distintas y no deben fusionarse en una sola función.
 """
 from __future__ import annotations
 
@@ -23,9 +42,11 @@ import datetime as dt
 import logging
 import os
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from polybot.config import settings
+from polybot.persistence.models import RealPosition
 
 logger = logging.getLogger(__name__)
 
@@ -55,17 +76,37 @@ def halt(reason: str, flag_path: str | None = None, session: Session | None = No
         log_event(session, "kill_switch_triggered", "critical", f"KILL-SWITCH ACTIVADO: {reason}")
 
 
+def committed_capital_usd(session: Session) -> float:
+    """Capital real comprometido en posiciones que todavía no cerraron
+    (`"enviada"`/`"abierta"`/`"pendiente"`) -- plata que salió de la wallet
+    pero no está perdida, sólo temporalmente fuera del balance líquido hasta
+    que la posición resuelva."""
+    stmt = select(func.coalesce(func.sum(RealPosition.cost_usd), 0.0)).where(
+        RealPosition.status.in_(("enviada", "abierta", "pendiente"))
+    )
+    return session.execute(stmt).scalar_one()
+
+
 def check_balance_kill_switch(
-    current_balance_usd: float, flag_path: str | None = None, session: Session | None = None
+    current_balance_usd: float, session: Session, flag_path: str | None = None
 ) -> bool:
-    """Activa el kill-switch automático si el balance real cae bajo el piso
+    """Activa el kill-switch automático si el EQUITY real (balance líquido +
+    capital comprometido en posiciones reales en curso) cae bajo el piso
     configurado (`REAL_KILL_SWITCH_BALANCE_FLOOR_USD`, default $15 = 25% de
     drawdown sobre $20 base). Devuelve True si el trading real está detenido
-    (ya sea por esto o porque ya lo estaba)."""
+    (ya sea por esto o porque ya lo estaba).
+
+    Usa equity y no el balance líquido crudo a propósito: el balance líquido
+    baja por sí solo cada vez que hay una posición real abierta (el capital
+    de esa posición sigue existiendo, sólo que no está en la wallet todavía)
+    -- comparar eso contra un piso fijo confunde "hay posiciones en curso"
+    con "se perdió plata de verdad" (ver docstring del módulo)."""
     floor = settings.real_kill_switch_balance_floor_usd
-    if current_balance_usd < floor:
+    equity = current_balance_usd + committed_capital_usd(session)
+    if equity < floor:
         halt(
-            f"balance real ${current_balance_usd:.2f} por debajo del piso ${floor:.2f}",
+            f"equity real ${equity:.2f} (balance líquido ${current_balance_usd:.2f} + "
+            f"comprometido ${equity - current_balance_usd:.2f}) por debajo del piso ${floor:.2f}",
             flag_path=flag_path,
             session=session,
         )
