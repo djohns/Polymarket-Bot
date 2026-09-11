@@ -92,6 +92,18 @@ def main() -> None:
 
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE real_positions RENAME TO real_positions_old"))
+        # SQLite mueve los índices junto con la tabla renombrada, conservando sus
+        # nombres originales (`ix_real_positions_*`) -- si no se los dropea acá,
+        # `create_all` de abajo choca al intentar crear índices con esos mismos
+        # nombres para la tabla `real_positions` nueva (los nombres de índice son
+        # globales en SQLite, no por-tabla). Verificado contra la VPS: sin este
+        # drop, el primer intento de esta migración falló a mitad de camino con
+        # "index ix_real_positions_market_id already exists" -- se dejó la base
+        # en un estado intermedio (`real_positions` nueva vacía +
+        # `real_positions_old` con los datos intactos) que se restauró a mano
+        # antes de agregar este fix.
+        for column in ("opened_at", "market_id", "cluster_id", "status"):
+            conn.execute(text(f"DROP INDEX IF EXISTS ix_real_positions_{column}"))
 
     # Crea `real_positions` con el esquema actual del ORM (yes_shares/no_shares/
     # leg_imbalance_pct, sin `shares`) -- no toca ninguna otra tabla existente.
