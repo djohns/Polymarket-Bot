@@ -1058,12 +1058,109 @@ flag para detener el trading, pero no se fusionan en una sola función --
 resuelven preguntas distintas y mezclarlas habría ocultado cuál de las dos
 disparó en cada caso.
 
+### Cuarta activación (2026-09-10) — tercer patrón de divergencia: `shares`/`yes_price_avg`/`no_price_avg` guardan la estimación de sizing, no el fill real confirmado
+
+Con el fix de equity ya en producción, la 4ta activación ejecutó 1 arb real
+(San Diego FC, `cost_usd=$5`) sin que llegara a darse el escenario de 2+
+posiciones simultáneas (no se pudo re-confirmar el fix de equity contra ese
+caso todavía). El job de resolución la cerró sola, sin intervención manual,
+~2h34m después de abrirse. Pero mientras la posición seguía genuinamente
+abierta, la reconciliación disparó el kill-switch a las 05:06:11 GMT:
+`balance real $22.59 vs. esperado $17.90 (diff +$4.68)`.
+
+**Esto NO es ninguno de los dos patrones ya documentados**: no es una orden
+real sin registrar (patrón 1, incidente original), y no es un mercado
+resuelto/redimido on-chain que el job todavía no había marcado `"cerrada"`
+(patrón 2, caso Santa Fe/HJK/Barcelona) -- de hecho el job cerró esta
+posición normalmente, sin lag ni intervención.
+
+**Causa raíz real, confirmada con flujos de caja on-chain
+(`data-api.polymarket.com/activity`, no inferencia)**: `real_executor.py`
+persiste `shares`, `yes_price_avg` y `no_price_avg` directamente desde
+`fill` -- el resultado de `simulate_arbitrage_fill` calculado **antes** de
+enviar las órdenes (la estimación de sizing contra la profundidad del book en
+ese instante), no desde la confirmación real del exchange (`get_trades`,
+que sí se usa para *detectar* si la orden llenó -- corrección #1 del
+incidente del 2026-09-08 -- pero nunca se usó para *corregir* los montos
+persistidos). Cuando el fill real de una pata difiere de esa estimación
+(precio distinto, o -- más grave -- **tamaño distinto entre las dos
+patas**, es decir la orden no quedó tan perfectamente calzada como el
+sizing previo asumía), `real_positions` queda con datos que no reflejan lo
+que realmente pasó en el exchange, y el `realized_pnl` que calcula
+`real_resolution_job.py` (`shares - cost_usd - fee_paid`, que asume una
+canasta simétrica) hereda ese error.
+
+Verificado para las 4 posiciones reales desde el checkpoint
+(`REAL_BALANCE_CHECKPOINT_USD=22.727494` @ 2026-09-08T22:04:40Z, sin cambios
+desde entonces -- **la hipótesis de que el checkpoint estaba desactualizado
+se descartó**: recalculando con el checkpoint tal cual está, usando el
+verdadero flujo de caja de cada pata en vez de los campos persistidos, el
+balance esperado coincide con el real al centésimo de centavo exacto, así
+que el checkpoint en sí nunca fue el problema):
+
+| Posición | pnl real (cash-flow on-chain) | pnl en la DB | diferencia |
+|---|---|---|---|
+| Santa Fe (id 5, corregida a mano) | -$0.002303 | -$0.0024 | ~$0 (ya estaba corregida) |
+| HJK Helsinki (id 6, auto) | +$0.437613 | +$0.149921 | DB **subestimó** la ganancia en $0.29 |
+| Barcelona/Feyenoord (id 7, auto) | +$0.142500 | +$0.026933 | DB **subestimó** la ganancia en $0.12 |
+| San Diego FC (id 8, auto) | **-$0.719811** | +$0.026211 | DB registró una **ganancia donde hubo una pérdida real** de -$0.75 |
+
+`checkpoint ($22.727494) + suma de pnl real de las 4 = $22.585493`, exacto
+contra `get_balance_allowance()` consultado en vivo el 2026-09-11 (mismo
+valor a los 6 decimales) -- la reconciliación basada en cash-flow real
+cierra perfectamente; la que usa los campos persistidos de `RealPosition`
+no, porque esos campos están mal desde el momento del fill, no por deriva
+posterior.
+
+**Caso más grave -- San Diego FC tuvo leg risk real, no un arb hedgeado**:
+el fill real compró 5.137255 shares YES a $0.51 y sólo **4.388889 shares
+NO a $0.54** (no ~5.15 a $0.46 como asumía el sizing) -- combinado, $0.51 +
+$0.54 = $1.05, **por encima de $1**, no es un arb válido si los tamaños
+fueran iguales. Con tamaños desiguales, sólo la pata más chica (NO, la que
+ganó) es redimible; toda la porción de YES sin cobertura (0.749 shares) se
+perdió por completo. El resultado real fue una pérdida de -$0.72 sobre una
+"ganancia esperada" de +$0.026 -- una diferencia de casi 30x, y de signo
+opuesto. Esto no rompió ningún límite de capital (seguía dentro del tope de
+$5/mercado) ni generó ninguna alerta aparte de la reconciliación, porque
+nada en el sistema compara el `shares`/`price` estimado contra el real
+después del fill.
+
+**Por qué no se notó en los patrones 1 y 2 con la misma claridad**: el
+incidente original (patrón 1) tenía posiciones nunca registradas en
+absoluto -- no había campos que comparar. El caso Santa Fe (patrón 2) se
+corrigió a mano usando `get_trades` real antes de que el job de resolución
+automático existiera, así que su `realized_pnl` en la DB ya refleja el
+cash-flow real (por eso su diferencia en la tabla es ~$0). HJK y Barcelona
+resolvieron con divergencias pequeñas ($0.12-$0.29) que quedaron
+enmascaradas porque las reconciliaciones periódicas del kill-switch dejaron
+de correr una vez que éste ya estaba activo por otra causa (el falso
+positivo del piso de equity, patrón previo) -- nadie las vio disparar solas.
+San Diego FC fue la primera vez que este bug produjo una divergencia lo
+bastante grande, con el kill-switch activo y sin otra causa compitiendo, como
+para hacerse notar por sí sola.
+
+**No se tocó código en esta investigación** (pedido explícito) -- el fix
+correcto (persistir en `RealPosition` los montos confirmados por
+`get_trades`/`_confirm_via_trades` en vez de la estimación de
+`simulate_arbitrage_fill`, y que `real_resolution_job.py` calcule
+`realized_pnl` sobre el tamaño real de cada pata en vez de asumir simetría)
+queda pendiente para una sesión futura, no autorizado todavía.
+
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
   puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
-  explícita del usuario. Esta sería la cuarta activación.
+  explícita del usuario. Esta sería la quinta activación.
+- **Nuevo, agregado en la investigación del patrón de divergencia #3**:
+  corregir `real_executor.py` para persistir `shares`/`yes_price_avg`/
+  `no_price_avg` desde el fill realmente confirmado (no la estimación
+  pre-trade), y `real_resolution_job.py` para calcular `realized_pnl` sobre
+  el tamaño real de cada pata (no asumir canasta simétrica) -- sin esto, el
+  P&L real reportado por el sistema no es confiable pata por pata, aunque el
+  balance total termine coincidiendo en la reconciliación por casualidad de
+  cancelación entre errores (como pasó acá: HJK y Barcelona subestimados
+  compensaron parcialmente el error de San Diego FC).
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
