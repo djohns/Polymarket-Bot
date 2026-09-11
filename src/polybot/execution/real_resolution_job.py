@@ -39,6 +39,11 @@ logger = logging.getLogger(__name__)
 
 
 async def resolve_open_real_positions(session: Session, *, fetch=fetch_market_resolution) -> None:
+    # "sin_confirmar" queda deliberadamente afuera: a diferencia de "pendiente"
+    # (shares reales confirmadas, aunque desbalanceadas), acá al menos una pata
+    # nunca se confirmó -- auto-resolver con esos valores sería tan malo como
+    # el bug que originó el estado (ver real_executor.py, incidente del
+    # 2026-09-11). Requiere revisión/backfill manual, mismo patrón que Santa Fe.
     open_positions = (
         session.execute(select(RealPosition).where(RealPosition.status.in_(("abierta", "pendiente"))))
         .scalars()

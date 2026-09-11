@@ -63,8 +63,13 @@ class FakeClient:
     orderID no tiene entrada, `get_order` lanza (simula que la consulta falla).
     `trades` (opcional) simula `get_trades` -- lista de dicts con al menos
     `taker_order_id` y `status` (y opcionalmente `size`/`price` reales, usados
-    por `_confirmed_fill` para el tamaño real de cada pata -- sin ellos cae al
-    fallback pre-trade, igual que si `get_trades` no encontrara nada). `asks`
+    por `_confirmed_fill` para el tamaño real de cada pata). `trades_sequence`
+    (opcional) simula una respuesta DISTINTA en cada llamada sucesiva a
+    `get_trades` -- índice `i` para la llamada número `i` (se clampea al
+    último elemento si hay más llamadas que entradas); usado para reproducir
+    el lag de indexación transitorio del incidente del 2026-09-11 (las
+    primeras llamadas vuelven vacías, una llamada posterior sí encuentra el
+    trade). Si no se pasa, `get_trades` siempre devuelve `trades`. `asks`
     (opcional, por token_id) simula `get_order_book` para el sizing en vivo de
     la pata NO -- por default un solo nivel amplio a 0.50, suficiente para no
     limitar la profundidad en los tests que no la ejercitan a propósito."""
@@ -74,11 +79,13 @@ class FakeClient:
         order_responses: list[dict],
         order_status_responses: dict | None = None,
         trades: list[dict] | None = None,
+        trades_sequence: list[list[dict]] | None = None,
         asks: dict[str, list[dict]] | None = None,
     ) -> None:
         self._order_responses = list(order_responses)
         self._order_status_responses = order_status_responses or {}
         self._trades = trades if trades is not None else []
+        self._trades_sequence = trades_sequence
         self._asks = asks or {}
         self.calls: list[tuple] = []
         self.get_order_calls: list[str] = []
@@ -96,7 +103,11 @@ class FakeClient:
         return self._order_status_responses[order_id]
 
     def get_trades(self, params, only_first_page=False):
+        call_index = len(self.get_trades_calls)
         self.get_trades_calls.append({"asset_id": params.asset_id})
+        if self._trades_sequence is not None:
+            idx = min(call_index, len(self._trades_sequence) - 1)
+            return self._trades_sequence[idx]
         return self._trades
 
     def get_order_book(self, token_id: str) -> dict:
@@ -114,6 +125,7 @@ def _enable_real_trading(request, tmp_path):
         "real_max_exposure_per_cluster_usd": 5.0,
         "real_capital_base_usd": 20.0,
         "real_kill_switch_flag_path": str(tmp_path / "HALT"),
+        "real_fill_confirm_retry_delay_seconds": 0.0,  # no dormir de verdad en tests
     }
     old = {k: getattr(settings, k) for k in overrides}
     for k, v in overrides.items():
@@ -161,7 +173,11 @@ def test_successful_fill_places_both_legs_and_persists_open_position(request, tm
         [
             {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
             {"transactionsHashes": ["0xno"], "orderID": "no-order"},
-        ]
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": "5.0", "price": "0.50"},
+        ],
     )
     engine = RealExecutionEngine(client, session_factory)
 
@@ -214,7 +230,11 @@ def test_tradeids_without_hashes_is_treated_as_filled(request, tmp_path):
         [
             {"transactionsHashes": [], "tradeIDs": ["trade-1"], "orderID": "yes-order"},
             {"transactionsHashes": ["0xno"], "orderID": "no-order"},
-        ]
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": "5.0", "price": "0.50"},
+        ],
     )
     engine = RealExecutionEngine(client, session_factory)
 
@@ -237,7 +257,12 @@ def test_ambiguous_order_status_defaults_to_filled_not_abandoned(request, tmp_pa
         [
             {"transactionsHashes": [], "orderID": "yes-order"},  # get_order para "yes-order" no está configurado -> lanza
             {"transactionsHashes": ["0xno"], "orderID": "no-order"},
-        ]
+        ],
+        trades_sequence=[
+            [],  # call 0: _confirm_via_trades (detección) para yes-order -- inconcluso a propósito
+            [{"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"}],
+            [{"taker_order_id": "no-order", "status": "CONFIRMED", "size": "5.0", "price": "0.50"}],
+        ],
     )
     engine = RealExecutionEngine(client, session_factory)
 
@@ -264,7 +289,10 @@ def test_confirmed_filled_via_get_trades_matches_real_incident_scenario(request,
             {"transactionsHashes": ["0xno"], "orderID": "no-order"},
         ],
         order_status_responses={},  # get_order("yes-order") no configurado -> lanza, igual que en la realidad
-        trades=[{"taker_order_id": "yes-order", "status": "CONFIRMED"}],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": "5.0", "price": "0.50"},
+        ],
     )
     engine = RealExecutionEngine(client, session_factory)
 
@@ -327,6 +355,7 @@ def test_leg_imbalance_halts_trading_and_flags_position(request, tmp_path):
             {"transactionsHashes": [], "orderID": "no-order"},
         ],
         order_status_responses={"no-order": {"status": "UNMATCHED", "size_matched": "0"}},
+        trades=[{"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"}],
     )
     engine = RealExecutionEngine(client, session_factory)
 
@@ -455,6 +484,75 @@ def test_real_cost_includes_taker_fee_not_just_price_times_shares(request, tmp_p
         assert abs(positions[0].cost_usd - expected_cost) < 1e-9
 
 
+def test_confirmed_fill_uses_real_value_after_transient_get_trades_lag(request, tmp_path):
+    """Reproduce el incidente del 2026-09-11 (Kashiwa Reysol, primera ejecución
+    real del nuevo flujo de sizing): `get_trades` no encuentra el trade de la
+    pata NO en el primer intento (lag de indexación transitorio), pero sí en
+    un reintento posterior. El resultado debe ser el valor REAL confirmado
+    (size=4.95, price=0.51, calzado dentro del umbral de 2%) -- no el
+    fallback fabricado del bug original."""
+    flag = _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+            {"transactionsHashes": ["0xno"], "orderID": "no-order"},
+        ],
+        trades_sequence=[
+            [{"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"}],
+            [],  # NO, primer intento: lag transitorio, no aparece todavía
+            [{"taker_order_id": "no-order", "status": "CONFIRMED", "size": "4.95", "price": "0.51"}],
+        ],
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert kill_switch.is_halted(str(flag)) is False
+    with session_factory() as session:
+        positions = session.execute(select(RealPosition)).scalars().all()
+        pos = positions[0]
+        assert pos.status == "abierta"
+        assert pos.no_shares == 4.95
+        assert pos.no_price_avg == 0.51
+
+
+def test_unconfirmed_fill_after_exhausting_retries_marks_sin_confirmar_and_halts(request, tmp_path):
+    """Si `get_trades` sigue sin encontrar el trade después de todos los
+    reintentos, el sistema NO debe asumir que la canasta quedó calzada (el
+    bug del incidente del 2026-09-11) -- debe marcar la posición
+    "sin_confirmar" y activar el kill-switch, igual que un leg imbalance."""
+    flag = _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+            {"transactionsHashes": ["0xno"], "orderID": "no-order"},
+        ],
+        trades_sequence=[
+            [{"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"}],
+            [],  # NO, todos los reintentos vuelven vacíos
+            [],
+            [],
+        ],
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert kill_switch.is_halted(str(flag)) is True
+    with session_factory() as session:
+        positions = session.execute(select(RealPosition)).scalars().all()
+        assert len(positions) == 1
+        pos = positions[0]
+        assert pos.status == "sin_confirmar"
+        assert "no se pudo confirmar" in pos.notes.lower()
+
+        events = session.execute(select(RealExecutionEvent)).scalars().all()
+        event_types = {e.event_type for e in events}
+        assert "fill_not_confirmed" in event_types
+
+
 def test_execution_events_are_persisted_to_db(request, tmp_path):
     """Los eventos críticos quedan en la base, no sólo en journald (ver
     incidente del 2026-09-08: journald rotó en horas y dejó el diagnóstico
@@ -465,7 +563,11 @@ def test_execution_events_are_persisted_to_db(request, tmp_path):
         [
             {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
             {"transactionsHashes": ["0xno"], "orderID": "no-order"},
-        ]
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": "5.0", "price": "0.50"},
+        ],
     )
     engine = RealExecutionEngine(client, session_factory)
 

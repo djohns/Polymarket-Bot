@@ -116,6 +116,9 @@ class RealPosition(Base):
     # nada de capital tocado) | "abierta" | "cerrada" | "pendiente" (leg imbalance
     # total O desbalance residual de shares más allá del umbral -- ver
     # `real_executor._leg_imbalance_pct` -- requiere revisión manual en ambos casos)
+    # | "sin_confirmar" (no se pudo confirmar el fill real de una pata tras
+    # reintentar get_trades -- ver incidente del 2026-09-11, no se asume canasta
+    # calzada ni desbalanceada, sólo que no se sabe con certeza)
     status: Mapped[str] = mapped_column(String, default="enviada", index=True)
 
     yes_shares: Mapped[float] = mapped_column(Float)

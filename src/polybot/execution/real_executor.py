@@ -74,10 +74,37 @@ severidad que un leg imbalance total (kill-switch + `status="pendiente"`) --
 es el mismo riesgo de fondo (exposición direccional real sin cobertura), sólo
 que llega por un camino distinto (ambas patas "llenaron" según `_is_order_filled`,
 pero con tamaños que no calzan) en vez de que una pata falle del todo.
+
+**Bug de fallback silencioso en `_confirmed_fill` -- primera ejecución real del
+nuevo flujo de sizing (2026-09-11, "Will Kashiwa Reysol win?")**: el sizing
+en sí funcionó bien (YES real=6.578948 shares, NO dimensionado correctamente
+por esa cantidad contra el book en vivo), pero `_confirmed_fill` tenía un
+`fallback_shares`/`fallback_price` que se usaba cuando `get_trades` no
+encontraba el trade -- y ese fallback **fabricaba silenciosamente** un
+resultado usando la estimación pre-trade, como si fuera el fill real
+confirmado. En producción, `get_trades` no encontró el trade de la pata NO en
+el primer intento (lag de indexación transitorio del exchange -- confirmado:
+la misma consulta, repetida minutos después, sí lo encontró con el tamaño y
+precio reales exactos), así que el fallback activó y registró `no_shares` =
+`yes_shares_real` (dando un falso 0.00% de desbalance) y `no_price_avg` = la
+estimación pre-trade (0.72, no el 0.85 real) -- subestimando el costo real en
+$0.82 (13% del trade) e **invirtiendo el signo del P&L** (+$0.475 registrado
+vs. -$0.344 real). La reconciliación detectó la divergencia igual y activó el
+kill-switch correctamente, pero por una causa distinta a la que su propio
+mensaje sugiere.
+
+Fix: `_confirmed_fill` reintenta `get_trades` con backoff corto (cubre el lag
+transitorio, que es la causa confirmada) y, si tras los reintentos sigue sin
+encontrar el trade, **ya no fabrica nada** -- devuelve `None`, y el caller
+marca la posición `status="sin_confirmar"` (no "abierta" ni "pendiente" con
+un desbalance inventado) y dispara el kill-switch con la misma severidad que
+un leg imbalance: no se puede operar con confianza si ni siquiera se puede
+verificar el resultado de la posición anterior.
 """
 from __future__ import annotations
 
 import logging
+import time
 
 from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType, TradeParams
 from py_clob_client_v2.constants import FAILED_TRADE_STATUS
@@ -106,7 +133,7 @@ def _real_exposure(session: Session, *, market_id: str | None = None, cluster_id
     recién enviada (o desbalanceada) ya compromete capital real aunque su
     resultado final todavía no esté confirmado."""
     stmt = select(func.coalesce(func.sum(RealPosition.cost_usd), 0.0)).where(
-        RealPosition.status.in_(("abierta", "enviada", "pendiente"))
+        RealPosition.status.in_(("abierta", "enviada", "pendiente", "sin_confirmar"))
     )
     if market_id is not None:
         stmt = stmt.where(RealPosition.market_id == market_id)
@@ -200,9 +227,43 @@ def _confirm_via_trades(client, token_id: str, order_id: str) -> bool | None:
     return None
 
 
+def _fetch_trade_totals(client, token_id: str, order_id: str) -> tuple[float, float] | None:
+    """Un intento de `get_trades(asset_id=token_id)`, filtrado por
+    `taker_order_id`. Devuelve `(total_size, total_raw_cost)` si encuentra al
+    menos un trade que matchee, o `None` si la consulta falla o no aparece
+    nada -- sin decidir qué hacer con eso, eso es responsabilidad de
+    `_confirmed_fill`."""
+    try:
+        trades = client.get_trades(TradeParams(asset_id=token_id), only_first_page=True)
+    except Exception:
+        logger.warning("Fallo consultando get_trades para la orden %s", order_id, exc_info=True)
+        return None
+
+    total_size = 0.0
+    total_raw_cost = 0.0
+    for trade in trades or []:
+        if trade.get("taker_order_id") != order_id and trade.get("takerOrderId") != order_id:
+            continue
+        try:
+            size = float(trade.get("size", 0))
+            price = float(trade.get("price", 0))
+        except (TypeError, ValueError):
+            continue
+        total_size += size
+        total_raw_cost += size * price
+
+    return (total_size, total_raw_cost) if total_size > 0 else None
+
+
 def _confirmed_fill(
-    client, token_id: str, order_id: str, market: MarketInfo, *, fallback_shares: float, fallback_price: float
-) -> tuple[float, float, float]:
+    client,
+    token_id: str,
+    order_id: str,
+    market: MarketInfo,
+    *,
+    retries: int = 3,
+    retry_delay_seconds: float = 2.0,
+) -> tuple[float, float, float] | None:
     """Recupera el tamaño, precio promedio y COSTO REAL (fee incluido) de una
     orden ya confirmada como llenada, vía `get_trades(asset_id=token_id)`
     filtrando por `taker_order_id` -- misma fuente que `_confirm_via_trades`
@@ -218,39 +279,29 @@ def _confirmed_fill(
     de error de registro que este módulo corrige -- sólo que en el costo en
     vez de en las shares.
 
+    **No fabrica un resultado si no puede confirmar** (corrección del
+    incidente del 2026-09-11, ver docstring del módulo): reintenta
+    `get_trades` hasta `retries` veces con `retry_delay_seconds` entre
+    intentos -- cubre el lag de indexación transitorio del exchange, que es
+    la causa confirmada del incidente (el mismo trade, consultado minutos
+    después, sí aparecía). Si después de todos los intentos sigue sin
+    aparecer nada, devuelve `None` -- es responsabilidad explícita del
+    caller tratar eso como "no se pudo confirmar" (`status="sin_confirmar"`
+    + kill-switch), nunca como "confirmado y calzado" con datos inventados.
     Si hay más de un trade para la misma orden (varios maker matcheados), se
-    promedia por tamaño. Si la consulta falla o no aparece ningún trade con
-    ese order_id, cae de vuelta a la estimación pre-trade (`fallback_*`) --
-    degradado, pero es el comportamiento anterior a este fix, no una
-    regresión nueva; el chequeo de desbalance residual post-fill
-    (`_leg_imbalance_pct`) sigue funcionando igual sobre lo que sea que
-    termine guardado."""
-    try:
-        trades = client.get_trades(TradeParams(asset_id=token_id), only_first_page=True)
-    except Exception:
-        logger.warning("No se pudo confirmar tamaño/precio real de la orden %s vía get_trades", order_id, exc_info=True)
-        trades = None
+    promedia por tamaño."""
+    for attempt in range(retries):
+        totals = _fetch_trade_totals(client, token_id, order_id)
+        if totals is not None:
+            total_size, total_raw_cost = totals
+            price_avg = total_raw_cost / total_size
+            cost_usd = total_raw_cost + taker_fee(total_size, price_avg, market)
+            return total_size, price_avg, cost_usd
 
-    total_size = 0.0
-    total_raw_cost = 0.0
-    for trade in trades or []:
-        if trade.get("taker_order_id") != order_id and trade.get("takerOrderId") != order_id:
-            continue
-        try:
-            size = float(trade.get("size", 0))
-            price = float(trade.get("price", 0))
-        except (TypeError, ValueError):
-            continue
-        total_size += size
-        total_raw_cost += size * price
+        if attempt < retries - 1:
+            time.sleep(retry_delay_seconds)
 
-    if total_size <= 0:
-        total_size = fallback_shares
-        total_raw_cost = fallback_shares * fallback_price
-
-    price_avg = total_raw_cost / total_size if total_size > 0 else 0.0
-    cost_usd = total_raw_cost + taker_fee(total_size, price_avg, market)
-    return total_size, price_avg, cost_usd
+    return None
 
 
 def _fresh_asks(client, token_id: str) -> dict[float, float]:
@@ -426,14 +477,18 @@ class RealExecutionEngine:
         # Tamaño y costo REALES de la pata YES (no la estimación pre-trade) -- ver
         # docstring del módulo, "Bug de sizing descubierto en la auditoría de la
         # 4ta activación".
-        yes_shares_real, yes_price_real, yes_cost_real = _confirmed_fill(
+        confirmed_yes = _confirmed_fill(
             self._client,
             market.yes_token_id,
             position.yes_order_id,
             market,
-            fallback_shares=fill.shares,
-            fallback_price=fill.yes_price_avg,
+            retries=settings.real_fill_confirm_retries,
+            retry_delay_seconds=settings.real_fill_confirm_retry_delay_seconds,
         )
+        if confirmed_yes is None:
+            self._handle_unconfirmed_fill(session, position, leg="YES")
+            return
+        yes_shares_real, yes_price_real, yes_cost_real = confirmed_yes
         position.yes_shares = yes_shares_real
         position.no_shares = 0.0  # todavía no se compró nada de NO
         position.yes_price_avg = yes_price_real
@@ -501,14 +556,18 @@ class RealExecutionEngine:
         # `yes_shares_real` (el objetivo) aunque el book en vivo se haya usado
         # para dimensionarla; el book pudo seguir moviéndose entre esa consulta
         # y el envío real.
-        no_shares_real, no_price_real, no_cost_real = _confirmed_fill(
+        confirmed_no = _confirmed_fill(
             self._client,
             market.no_token_id,
             position.no_order_id,
             market,
-            fallback_shares=yes_shares_real,
-            fallback_price=fill.no_price_avg,
+            retries=settings.real_fill_confirm_retries,
+            retry_delay_seconds=settings.real_fill_confirm_retry_delay_seconds,
         )
+        if confirmed_no is None:
+            self._handle_unconfirmed_fill(session, position, leg="NO")
+            return
+        no_shares_real, no_price_real, no_cost_real = confirmed_no
         position.no_shares = no_shares_real
         position.no_price_avg = no_price_real
         position.cost_usd = yes_cost_real + no_cost_real
@@ -576,5 +635,38 @@ class RealExecutionEngine:
 
         kill_switch.halt(
             f"leg imbalance real en mercado {position.market_id} -- pata YES llenó, pata NO no confirmó",
+            session=session,
+        )
+
+    def _handle_unconfirmed_fill(self, session: Session, position: RealPosition, *, leg: str) -> None:
+        """`_confirmed_fill` agotó los reintentos sin encontrar el trade real de
+        la pata `leg` -- no se puede saber con certeza cuánto llenó ni a qué
+        precio. Se trata con la misma severidad que un leg imbalance (ver
+        docstring del módulo, incidente del 2026-09-11): no se asume nada
+        (ni que calzó, ni que no), se detiene el trading real para revisión
+        manual. `yes_shares`/`no_shares`/`cost_usd` quedan en lo último que sí
+        se confirmó (la estimación pre-trade si es la pata YES la que no se
+        pudo confirmar; el costo real de YES solo si fue la pata NO)."""
+        position.status = "sin_confirmar"
+        position.notes = (
+            f"No se pudo confirmar el fill real de la pata {leg} tras reintentar "
+            "get_trades (posible lag de indexación del exchange) -- el sistema NO "
+            "puede garantizar que la canasta esté calzada ni el costo real. "
+            "Requiere revisión manual antes de continuar."
+        )
+        session.commit()
+
+        log_event(
+            session,
+            "fill_not_confirmed",
+            "critical",
+            f"No se pudo confirmar el fill real de la pata {leg} en {position.question[:60]} "
+            "tras reintentar -- posición marcada sin_confirmar, no se asume canasta calzada",
+            market_id=position.market_id,
+            real_position_id=position.id,
+        )
+        kill_switch.halt(
+            f"fill sin confirmar en mercado {position.market_id} (pata {leg}) -- "
+            "no se puede garantizar el estado real de la posición",
             session=session,
         )

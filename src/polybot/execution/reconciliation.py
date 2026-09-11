@@ -44,7 +44,7 @@ def expected_balance_usd(session: Session) -> float:
         reference = settings.real_balance_checkpoint_usd
         since = dt.datetime.fromisoformat(settings.real_balance_checkpoint_at)
         committed_stmt = select(func.coalesce(func.sum(RealPosition.cost_usd), 0.0)).where(
-            RealPosition.status.in_(("enviada", "abierta", "pendiente")),
+            RealPosition.status.in_(("enviada", "abierta", "pendiente", "sin_confirmar")),
             RealPosition.opened_at >= since,
         )
         realized_stmt = select(func.coalesce(func.sum(RealPosition.realized_pnl), 0.0)).where(
@@ -54,7 +54,7 @@ def expected_balance_usd(session: Session) -> float:
     else:
         reference = settings.real_capital_base_usd
         committed_stmt = select(func.coalesce(func.sum(RealPosition.cost_usd), 0.0)).where(
-            RealPosition.status.in_(("enviada", "abierta", "pendiente"))
+            RealPosition.status.in_(("enviada", "abierta", "pendiente", "sin_confirmar"))
         )
         realized_stmt = select(func.coalesce(func.sum(RealPosition.realized_pnl), 0.0)).where(
             RealPosition.status == "cerrada"

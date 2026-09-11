@@ -1236,14 +1236,99 @@ se dimensiona por las shares reales de YES, no por la estimación pre-trade),
 `test_execution_real_resolution_job.py` (la fórmula unificada de payout usa
 las shares reales del lado ganador, no un promedio).
 
+### Quinta activación (2026-09-11) — primera ejecución real del nuevo flujo de sizing, y un bug de fallback silencioso en `_confirmed_fill`
+
+Con el rediseño de sizing ya en producción, la 5ta activación ejecutó el
+primer arb real con el flujo nuevo: *"Will Kashiwa Reysol win on
+2026-09-11?"* (10:36:37 GMT). El sizing en sí funcionó exactamente como se
+diseñó: YES llenó **6.578948 shares reales** (la estimación pre-trade era
+sólo 5.00 -- había más profundidad real disponible), y la pata NO se
+dimensionó por esa cantidad real contra el book de NO en vivo, no por un
+presupuesto independiente.
+
+Pero ~1m45s después de abrirse, la reconciliación disparó el kill-switch:
+`balance real $15.66 vs. esperado $16.48 (diff -$0.82)`. La causa **no era
+otro caso de leg imbalance real** -- era un bug nuevo, distinto, en el propio
+mecanismo de confirmación que el rediseño había introducido.
+
+**Causa raíz -- `_confirmed_fill` fabricaba un resultado cuando `get_trades`
+no encontraba el trade, en vez de señalar que no se había confirmado nada**:
+la función tenía parámetros `fallback_shares`/`fallback_price` que se usaban
+si `get_trades` no traía ningún trade con el `taker_order_id` buscado. En
+este caso, `get_trades` no encontró el trade de la pata NO en el primer
+(único) intento -- confirmado como **lag de indexación transitorio**, no un
+"no llenó": la misma consulta, repetida minutos después, sí lo encontró con
+el `taker_order_id` exacto, tamaño y precio reales
+(`get_trades(asset_id=...)` → `{"size": "6.56776", "price": "0.85", "status":
+"CONFIRMED", ...}`). El fallback activó y registró `no_shares` =
+`yes_shares_real` (6.578948, dando un **falso 0.00% de desbalance** -- no
+porque calzara de verdad, sino porque es literalmente el valor de fallback)
+y `no_price_avg` = la estimación pre-trade (0.72, no el 0.85 real).
+
+**Impacto medido** (reconstruido con `data-api.polymarket.com/activity`,
+confirmado independientemente contra `get_trades` en vivo):
+
+| Campo | Registrado (fallback) | Real |
+|---|---|---|
+| NO shares | 6.578948 | 6.56776 |
+| NO precio | 0.72 | 0.8496041268 |
+| Desbalance | 0.00% | 0.17% (igual habría estado dentro del umbral de 2%) |
+| Costo total | $6.10 | $6.922576 |
+| P&L | **+$0.475** (ganancia) | **-$0.344** (pérdida) -- signo invertido |
+
+La reconciliación detectó la divergencia y activó el kill-switch
+correctamente (la red de seguridad funcionó), pero por una causa distinta a
+la que su propio mensaje sugiere ("orden real que no quedó registrada") --
+acá la orden sí estaba registrada, sólo que con datos fabricados en vez de
+reales.
+
+**Fix -- reintentos con backoff, y "no confirmado" en vez de "fabricado"**:
+`_confirmed_fill` ahora reintenta `get_trades` hasta
+`REAL_FILL_CONFIRM_RETRIES` veces (default 3) con
+`REAL_FILL_CONFIRM_RETRY_DELAY_SECONDS` entre intentos (default 2s) -- cubre
+el lag transitorio, que es la causa confirmada. Si tras todos los intentos
+sigue sin encontrar el trade, **ya no fabrica nada**: devuelve `None`, y
+`RealExecutionEngine._handle_unconfirmed_fill` marca la posición
+`status="sin_confirmar"` (nuevo estado, ver `persistence/models.py`) y
+dispara el kill-switch con la misma severidad que un leg imbalance -- no se
+puede operar con confianza si ni siquiera se puede verificar el resultado de
+la posición anterior. `"sin_confirmar"` se excluye deliberadamente del scope
+de `real_resolution_job.py` (auto-resolverla con valores no confirmados sería
+tan malo como el bug original) -- requiere revisión/backfill manual, mismo
+patrón que el caso Santa Fe.
+
+**Revisión del mismo patrón en el resto del módulo (pedida explícitamente)**:
+el único otro lugar con un fallback de última instancia es `_is_order_filled`
+(*"si todo es inconcluso, asumir LLENADA"*) -- pero es una decisión distinta
+y ya razonada aparte (corrección central del incidente del 2026-09-08): es
+una decisión BOOLEANA sobre si seguir con el flujo o no, no fabrica shares ni
+precios. `_fresh_asks`/`_cost_for_target_shares` (sizing de la pata NO) no
+fabrican nada tampoco -- si la profundidad del book en vivo no alcanza,
+cubren lo que hay y lo loguean como warning, sin fingir haber cubierto más.
+No se encontró el mismo anti-patrón (fabricar un valor como si fuera
+confirmado) en ningún otro lugar.
+
+**Corrección retroactiva**: `real_positions.id=9` corregida con los valores
+reales (`scripts/fix_position_9_kashiwa_reysol_2026_09_11.py`, ejecutado una
+sola vez) -- `cost_usd=$6.922576`, `realized_pnl=-$0.343628`,
+`leg_imbalance_pct=0.17%`.
+
+**Tests**: `test_confirmed_fill_uses_real_value_after_transient_get_trades_lag`
+(falla en el primer intento, encuentra el trade real en un reintento -- usa
+ese valor real, no el fallback), `test_unconfirmed_fill_after_exhausting_retries_marks_sin_confirmar_and_halts`
+(falla en todos los reintentos -- `status="sin_confirmar"` + kill-switch, no
+asume canasta calzada).
+
+**Variables nuevas en `.env`**: `REAL_FILL_CONFIRM_RETRIES` (3),
+`REAL_FILL_CONFIRM_RETRY_DELAY_SECONDS` (2.0).
+
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
   puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
   explícita del usuario, con el mismo nivel de escrutinio que las veces
-  anteriores (o más, dado que este bug de sizing fue más fundamental que los
-  anteriores). Esta sería la quinta activación.
+  anteriores. Esta sería la sexta activación.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 

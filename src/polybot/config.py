@@ -108,6 +108,13 @@ class Settings:
     # un desbalance real como el observado (10.6%-24.2% en las 4 posiciones
     # afectadas).
     real_leg_imbalance_threshold_pct: float = _float_env("REAL_LEG_IMBALANCE_THRESHOLD_PCT", 0.02)
+    # Reintentos de get_trades en execution.real_executor._confirmed_fill antes
+    # de marcar una pata "sin_confirmar" -- cubren el lag de indexación
+    # transitorio del exchange confirmado en producción el 2026-09-11 (el
+    # mismo trade, consultado minutos después, sí aparecía). Ver CLAUDE.md,
+    # sección Fase 3, "Bug de fallback silencioso en _confirmed_fill".
+    real_fill_confirm_retries: int = _int_env("REAL_FILL_CONFIRM_RETRIES", 3)
+    real_fill_confirm_retry_delay_seconds: float = _float_env("REAL_FILL_CONFIRM_RETRY_DELAY_SECONDS", 2.0)
 
 
 settings = Settings()

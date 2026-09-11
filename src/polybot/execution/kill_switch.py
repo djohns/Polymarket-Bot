@@ -82,7 +82,7 @@ def committed_capital_usd(session: Session) -> float:
     pero no está perdida, sólo temporalmente fuera del balance líquido hasta
     que la posición resuelva."""
     stmt = select(func.coalesce(func.sum(RealPosition.cost_usd), 0.0)).where(
-        RealPosition.status.in_(("enviada", "abierta", "pendiente"))
+        RealPosition.status.in_(("enviada", "abierta", "pendiente", "sin_confirmar"))
     )
     return session.execute(stmt).scalar_one()
 
