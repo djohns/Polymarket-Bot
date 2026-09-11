@@ -109,12 +109,12 @@ def test_two_concurrent_open_positions_do_not_trigger_false_positive(tmp_path):
                 [
                     RealPosition(
                         market_id="0xa", cluster_id="c1", question="q1", status="abierta",
-                        shares=5.26, yes_price_avg=0.3, no_price_avg=0.6, cost_usd=5.0,
+                        yes_shares=5.26, no_shares=5.26, yes_price_avg=0.3, no_price_avg=0.6, cost_usd=5.0,
                         fee_paid=0.05, net_pnl_expected=0.15,
                     ),
                     RealPosition(
                         market_id="0xb", cluster_id="c2", question="q2", status="abierta",
-                        shares=5.15, yes_price_avg=0.5, no_price_avg=0.4, cost_usd=5.0,
+                        yes_shares=5.15, no_shares=5.15, yes_price_avg=0.5, no_price_avg=0.4, cost_usd=5.0,
                         fee_paid=0.05, net_pnl_expected=0.03,
                     ),
                 ]
@@ -141,7 +141,7 @@ def test_real_drawdown_with_open_positions_still_triggers(tmp_path):
             session.add(
                 RealPosition(
                     market_id="0xa", cluster_id="c1", question="q1", status="abierta",
-                    shares=5.0, yes_price_avg=0.3, no_price_avg=0.6, cost_usd=5.0,
+                    yes_shares=5.0, no_shares=5.0, yes_price_avg=0.3, no_price_avg=0.6, cost_usd=5.0,
                     fee_paid=0.05, net_pnl_expected=0.15,
                 )
             )

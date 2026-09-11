@@ -10,13 +10,18 @@ comparara contra un estado desactualizado y disparara el kill-switch por una
 causa en realidad benigna (ver CLAUDE.md, sección Fase 3, "divergencia de
 reconciliación del 2026-09-09").
 
-Dos tipos de posición real, con payout distinto al resolver:
-- `status="abierta"`: ambas patas (YES y NO) llenaron -- basket de arb
-  completo, payout garantizado de $1/share sin importar el resultado (mismo
-  cálculo que `SimulatedPosition`).
-- `status="pendiente"` (leg imbalance): sólo la pata YES tiene capital real
-  comprometido -- el payout depende del resultado real (gana si YES resultó
-  ganador, pierde todo si no).
+Payout: `winning_shares - cost_usd`, donde `winning_shares` es la cantidad
+REAL confirmada del lado que ganó (`yes_shares` o `no_shares`, ver
+`persistence.models.RealPosition` y `execution.real_executor._confirmed_fill`)
+y `cost_usd` es el gasto real total de ambas patas. Una única fórmula sirve
+tanto para una canasta bien calzada (payout = $1 × shares del lado ganador,
+igual que antes) como para una posición con leg imbalance total (`no_shares=0`,
+el payout es simplemente 0 si ganó el lado sin capital) o con desbalance
+residual (`status="pendiente"` con ambas patas > 0 pero desiguales) -- no hace
+falta distinguir el caso por `status`, sólo usar las shares reales de cada
+lado (ver CLAUDE.md, sección Fase 3, "Bug de sizing descubierto en la
+auditoría de la 4ta activación", para el porqué de este cambio respecto a la
+fórmula anterior, que asumía una única `shares` compartida por ambas patas).
 """
 from __future__ import annotations
 
@@ -69,13 +74,8 @@ async def resolve_open_real_positions(session: Session, *, fetch=fetch_market_re
 
 def _close_real_position(session: Session, pos: RealPosition, winning_outcome: str, now: dt.datetime) -> None:
     was_leg_imbalance = pos.status == "pendiente"
-    if was_leg_imbalance:
-        # Sólo la pata YES tiene capital real -- el payout depende del resultado.
-        realized = (pos.shares - pos.cost_usd) if winning_outcome == "YES" else -pos.cost_usd
-    else:
-        # Basket completo (ambas patas llenaron) -- payout garantizado de $1/share,
-        # mismo cálculo que SimulatedPosition._close_position.
-        realized = pos.shares - pos.cost_usd - pos.fee_paid
+    winning_shares = pos.yes_shares if winning_outcome == "YES" else pos.no_shares
+    realized = winning_shares - pos.cost_usd
 
     pos.status = "cerrada"
     pos.resolved_outcome = winning_outcome
@@ -87,7 +87,7 @@ def _close_real_position(session: Session, pos: RealPosition, winning_outcome: s
         "position_resolved",
         "info",
         f"POSICIÓN REAL RESUELTA {pos.question[:60]} | outcome={winning_outcome} "
-        f"realized_pnl={realized:.4f}{' (leg imbalance)' if was_leg_imbalance else ''}",
+        f"realized_pnl={realized:.4f}{' (leg imbalance/desbalance)' if was_leg_imbalance else ''}",
         market_id=pos.market_id,
         real_position_id=pos.id,
     )

@@ -40,6 +40,40 @@ Dos correcciones estructurales resultantes, ambas en este módulo:
 2. Cada pata se persiste en `real_positions` ANTES de saber si llenó (estado
    "enviada"), no después -- para que una orden real nunca vuelva a quedar
    invisible, sea cual sea la ambigüedad de la respuesta del exchange.
+
+**Bug de sizing descubierto en la auditoría de la 4ta activación (2026-09-10/11)**
+-- ver CLAUDE.md, sección Fase 3, para el detalle completo con los 4 casos
+reconstruidos on-chain: las dos patas se dimensionaban de forma INDEPENDIENTE,
+cada una con su propio presupuesto en dólares derivado de un único
+`fill.shares` estimado ANTES de mandar ninguna orden (`simulate_arbitrage_fill`,
+caminando el book local del WS). `MarketOrderArgsV2.amount` para una orden BUY
+es un monto en dólares, no una cantidad de shares (el SDK no ofrece "comprar
+exactamente N shares" para el lado BUY) -- así que la cantidad REAL de shares
+que entrega cada pata es `presupuesto / precio_real_de_ejecución`, y ese precio
+real puede diferir del estimado, sobre todo en la pata NO (enviada segunda,
+después de confirmar el fill de YES, con el book real ya movido). Resultado
+verificado en las 4 posiciones que llegaron a ejecutar ambas patas desde el
+incidente: **las 4 terminaron con cantidades de shares YES y NO distintas**
+(10.6% a 24.2% de diferencia) -- el sistema creía tener una canasta de arb sin
+riesgo cuando en realidad quedaba una porción sin cobertura, expuesta
+direccionalmente con capital real, sin ninguna alerta en el momento (recién se
+detectó por reconstrucción manual de flujo de caja on-chain).
+
+Fix aplicado: la pata NO ya no se dimensiona con un presupuesto independiente
+-- se dimensiona por la cantidad REAL de shares que confirmó la pata YES
+(`_confirmed_fill` primero, para saber cuánto llenó YES de verdad;
+`_budget_for_no_leg` después, caminando el book de NO EN VIVO -- no el book
+local del WS, potencialmente desatrasado -- para estimar cuántos dólares hacen
+falta para esa cantidad exacta de shares). Esto reduce el desbalance esperado
+pero no lo elimina: el book de NO puede seguir moviéndose entre esa consulta y
+el envío real de la orden, y el SDK sigue sin aceptar una cantidad de shares
+exacta para BUY. Por eso hay una red de seguridad adicional después de
+confirmar el fill real de ambas patas (`_leg_imbalance_pct`): si el desbalance
+residual supera `REAL_LEG_IMBALANCE_THRESHOLD_PCT`, se trata con la misma
+severidad que un leg imbalance total (kill-switch + `status="pendiente"`) --
+es el mismo riesgo de fondo (exposición direccional real sin cobertura), sólo
+que llega por un camino distinto (ambas patas "llenaron" según `_is_order_filled`,
+pero con tamaños que no calzan) en vez de que una pata falle del todo.
 """
 from __future__ import annotations
 
@@ -60,6 +94,7 @@ from polybot.ingestion.gamma_discovery import MarketInfo
 from polybot.ingestion.orderbook import OrderBook
 from polybot.persistence.models import RealPosition
 from polybot.risk.sizing import max_capital_for_real_trade
+from polybot.signals.fees import taker_fee
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +200,95 @@ def _confirm_via_trades(client, token_id: str, order_id: str) -> bool | None:
     return None
 
 
+def _confirmed_fill(
+    client, token_id: str, order_id: str, market: MarketInfo, *, fallback_shares: float, fallback_price: float
+) -> tuple[float, float, float]:
+    """Recupera el tamaño, precio promedio y COSTO REAL (fee incluido) de una
+    orden ya confirmada como llenada, vía `get_trades(asset_id=token_id)`
+    filtrando por `taker_order_id` -- misma fuente que `_confirm_via_trades`
+    (validada contra el servidor real en el incidente del 2026-09-08), pero
+    acá se lee el `size`/`price` de cada trade en vez de sólo su `status`.
+
+    El `price` que devuelve `get_trades` es el precio de ejecución SIN fee --
+    verificado en la auditoría de la 4ta activación comparando contra
+    `usdcSize` de `data-api.polymarket.com/activity` (el gasto real en la
+    wallet): la diferencia coincide con `taker_fee(size, price, market)`, no
+    con cero. Sin sumar el fee acá, `cost_usd` quedaría subestimado en el
+    orden del fee taker real (~2-5% observado), reintroduciendo el mismo tipo
+    de error de registro que este módulo corrige -- sólo que en el costo en
+    vez de en las shares.
+
+    Si hay más de un trade para la misma orden (varios maker matcheados), se
+    promedia por tamaño. Si la consulta falla o no aparece ningún trade con
+    ese order_id, cae de vuelta a la estimación pre-trade (`fallback_*`) --
+    degradado, pero es el comportamiento anterior a este fix, no una
+    regresión nueva; el chequeo de desbalance residual post-fill
+    (`_leg_imbalance_pct`) sigue funcionando igual sobre lo que sea que
+    termine guardado."""
+    try:
+        trades = client.get_trades(TradeParams(asset_id=token_id), only_first_page=True)
+    except Exception:
+        logger.warning("No se pudo confirmar tamaño/precio real de la orden %s vía get_trades", order_id, exc_info=True)
+        trades = None
+
+    total_size = 0.0
+    total_raw_cost = 0.0
+    for trade in trades or []:
+        if trade.get("taker_order_id") != order_id and trade.get("takerOrderId") != order_id:
+            continue
+        try:
+            size = float(trade.get("size", 0))
+            price = float(trade.get("price", 0))
+        except (TypeError, ValueError):
+            continue
+        total_size += size
+        total_raw_cost += size * price
+
+    if total_size <= 0:
+        total_size = fallback_shares
+        total_raw_cost = fallback_shares * fallback_price
+
+    price_avg = total_raw_cost / total_size if total_size > 0 else 0.0
+    cost_usd = total_raw_cost + taker_fee(total_size, price_avg, market)
+    return total_size, price_avg, cost_usd
+
+
+def _fresh_asks(client, token_id: str) -> dict[float, float]:
+    """Book de asks de `token_id` consultado EN VIVO (`get_order_book`, REST),
+    no el book local mantenido por el WS -- para cuando se llega a dimensionar
+    la pata NO ya pasó tiempo real (confirmar el fill de YES, alguna consulta
+    extra de `get_trades`), y el book local puede estar desatrasado respecto
+    al libro real justo cuando más importa la precisión."""
+    raw = client.get_order_book(token_id)
+    return {float(lvl["price"]): float(lvl["size"]) for lvl in (raw.get("asks") or [])}
+
+
+def _cost_for_target_shares(asks: dict[float, float], target_shares: float) -> tuple[float, float]:
+    """Camina los niveles ask (precio ascendente) acumulando hasta cubrir
+    `target_shares` (o lo que la profundidad disponible permita, si es menos).
+    Devuelve `(costo_usd, shares_cubiertas)`."""
+    remaining = target_shares
+    cost = 0.0
+    covered = 0.0
+    for price, size in sorted(asks.items()):
+        if remaining <= 0:
+            break
+        take = min(size, remaining)
+        cost += take * price
+        covered += take
+        remaining -= take
+    return cost, covered
+
+
+def _leg_imbalance_pct(yes_shares: float, no_shares: float) -> float:
+    """Diferencia relativa entre las dos patas, contra la más grande de las
+    dos -- 0.0 si están perfectamente calzadas, 1.0 si una de las dos es cero."""
+    larger = max(yes_shares, no_shares)
+    if larger <= 0:
+        return 0.0
+    return abs(yes_shares - no_shares) / larger
+
+
 def _is_order_filled(client, response: dict, token_id: str) -> bool:
     """Determina si una orden real llenó. Ya NO confía únicamente en
     `transactionsHashes` (ver el incidente documentado en el docstring del
@@ -230,14 +354,17 @@ class RealExecutionEngine:
 
     def _execute_fill(self, session: Session, market: MarketInfo, fill) -> None:
         yes_budget = fill.shares * fill.yes_price_avg
-        no_budget = fill.shares * fill.no_price_avg
 
         position = RealPosition(
             market_id=market.condition_id,
             cluster_id=market.cluster_id,
             question=market.question,
             status="enviada",
-            shares=fill.shares,
+            # Valores pre-trade -- se sobreescriben con el fill real confirmado
+            # más abajo (`_confirmed_fill`). Quedan acá sólo como mejor estimado
+            # disponible mientras la orden YES todavía no se mandó.
+            yes_shares=fill.shares,
+            no_shares=fill.shares,
             yes_price_avg=fill.yes_price_avg,
             no_price_avg=fill.no_price_avg,
             cost_usd=fill.cost_usd,
@@ -251,8 +378,8 @@ class RealExecutionEngine:
             session,
             "order_sent",
             "info",
-            f"EJECUCIÓN REAL {market.question[:60]} | shares={fill.shares:.2f} "
-            f"yes_budget={yes_budget:.2f} no_budget={no_budget:.2f} net_pnl_esperado={fill.net_pnl:.4f}",
+            f"EJECUCIÓN REAL {market.question[:60]} | shares_estimadas={fill.shares:.2f} "
+            f"yes_budget={yes_budget:.2f} net_pnl_esperado={fill.net_pnl:.4f}",
             market_id=market.condition_id,
             real_position_id=position.id,
         )
@@ -296,14 +423,46 @@ class RealExecutionEngine:
             )
             return
 
+        # Tamaño y costo REALES de la pata YES (no la estimación pre-trade) -- ver
+        # docstring del módulo, "Bug de sizing descubierto en la auditoría de la
+        # 4ta activación".
+        yes_shares_real, yes_price_real, yes_cost_real = _confirmed_fill(
+            self._client,
+            market.yes_token_id,
+            position.yes_order_id,
+            market,
+            fallback_shares=fill.shares,
+            fallback_price=fill.yes_price_avg,
+        )
+        position.yes_shares = yes_shares_real
+        position.no_shares = 0.0  # todavía no se compró nada de NO
+        position.yes_price_avg = yes_price_real
+        position.cost_usd = yes_cost_real  # interino -- si algo falla antes de NO, ya queda correcto
+        session.commit()
+
         log_event(
             session,
             "order_filled",
             "info",
-            f"Orden YES real llenó en {market.question[:60]}, enviando pata NO",
+            f"Orden YES real llenó en {market.question[:60]} | shares_reales={yes_shares_real:.4f} "
+            f"(estimadas={fill.shares:.4f}), enviando pata NO dimensionada por ese tamaño real",
             market_id=market.condition_id,
             real_position_id=position.id,
         )
+
+        # La pata NO se dimensiona por la cantidad REAL de shares de YES, no por
+        # un presupuesto independiente -- caminando el book de NO EN VIVO (no el
+        # snapshot local del WS, que puede estar desatrasado a esta altura).
+        no_asks = _fresh_asks(self._client, market.no_token_id)
+        no_budget, no_covered = _cost_for_target_shares(no_asks, yes_shares_real)
+        if no_covered < yes_shares_real:
+            logger.warning(
+                "Profundidad insuficiente en el book de NO para %s: se necesitaban %.4f shares, "
+                "el book en vivo sólo cubre %.4f -- se manda el presupuesto para lo que alcanza",
+                market.question[:60],
+                yes_shares_real,
+                no_covered,
+            )
 
         try:
             no_resp = _place_market_buy(self._client, market.no_token_id, no_budget)
@@ -338,13 +497,68 @@ class RealExecutionEngine:
             self._handle_leg_imbalance(session, position, no_resp=no_resp)
             return
 
+        # Tamaño y costo REALES de la pata NO -- las shares pueden diferir de
+        # `yes_shares_real` (el objetivo) aunque el book en vivo se haya usado
+        # para dimensionarla; el book pudo seguir moviéndose entre esa consulta
+        # y el envío real.
+        no_shares_real, no_price_real, no_cost_real = _confirmed_fill(
+            self._client,
+            market.no_token_id,
+            position.no_order_id,
+            market,
+            fallback_shares=yes_shares_real,
+            fallback_price=fill.no_price_avg,
+        )
+        position.no_shares = no_shares_real
+        position.no_price_avg = no_price_real
+        position.cost_usd = yes_cost_real + no_cost_real
+        session.commit()
+
+        imbalance_pct = _leg_imbalance_pct(yes_shares_real, no_shares_real)
+        position.leg_imbalance_pct = imbalance_pct
+
+        if imbalance_pct > settings.real_leg_imbalance_threshold_pct:
+            # Ambas patas "llenaron" según `_is_order_filled`, pero con tamaños que no
+            # calzan -- mismo riesgo de fondo que un leg imbalance total (exposición
+            # direccional real sin cobertura completa), sólo que llega por un camino
+            # distinto. Se trata igual: "pendiente" + kill-switch, no se asume canasta
+            # calzada. Ver docstring del módulo.
+            position.status = "pendiente"
+            position.notes = (
+                f"Desbalance residual de shares tras confirmar ambas patas: "
+                f"YES={yes_shares_real:.4f} NO={no_shares_real:.4f} "
+                f"({imbalance_pct:.1%} > umbral {settings.real_leg_imbalance_threshold_pct:.1%}) -- "
+                "ambas patas llenaron pero la canasta no quedó calzada; hay exposición "
+                "direccional real sin cobertura completa, requiere revisión manual."
+            )
+            session.commit()
+            log_event(
+                session,
+                "leg_size_mismatch",
+                "critical",
+                f"Desbalance residual en {market.question[:60]}: YES={yes_shares_real:.4f} "
+                f"NO={no_shares_real:.4f} ({imbalance_pct:.1%}) -- ambas patas llenaron pero "
+                "la canasta no quedó calzada, hay exposición direccional real sin cobertura",
+                market_id=market.condition_id,
+                real_position_id=position.id,
+            )
+            kill_switch.halt(
+                f"desbalance residual de shares en mercado {market.condition_id} "
+                f"({imbalance_pct:.1%} > umbral {settings.real_leg_imbalance_threshold_pct:.1%}) -- "
+                "ambas patas llenaron pero con tamaños distintos",
+                session=session,
+            )
+            return
+
         position.status = "abierta"
         session.commit()
         log_event(
             session,
             "position_opened",
             "info",
-            f"Posición real abierta en {market.question[:60]} | cost_usd={position.cost_usd:.2f}",
+            f"Posición real abierta en {market.question[:60]} | cost_usd={position.cost_usd:.2f} "
+            f"yes_shares={yes_shares_real:.4f} no_shares={no_shares_real:.4f} "
+            f"desbalance={imbalance_pct:.2%}",
             market_id=market.condition_id,
             real_position_id=position.id,
         )
@@ -353,7 +567,9 @@ class RealExecutionEngine:
         """Marca la posición desbalanceada y detiene todo trading real de inmediato --
         no se intenta deshacer ni recuperar automáticamente (ver CLAUDE.md)."""
         position.status = "pendiente"
-        position.cost_usd = position.shares * position.yes_price_avg  # sólo la pata YES realmente costó capital
+        position.no_shares = 0.0  # la pata NO nunca se confirmó -- no hay capital real ahí
+        # cost_usd ya quedó en el costo real de sólo YES (fee incluido) desde que se
+        # confirmó esa pata -- no hace falta recalcularlo acá.
         position.fee_paid = 0.0
         position.notes = "Leg imbalance: pata YES llenó, pata NO no confirmó."
         session.commit()

@@ -99,6 +99,15 @@ class Settings:
     # Wallet"/MetaMask con ese valor: se verificó empíricamente contra el balance real
     # on-chain de la cuenta y sólo signature_type=3 lo reflejó. Configurable por cuenta.
     real_signature_type: int = _int_env("REAL_SIGNATURE_TYPE", 3)
+    # Diferencia relativa máxima tolerada entre las shares reales de YES y NO
+    # de una misma posición real antes de tratarla como exposición direccional
+    # residual (mismo riesgo que un leg imbalance total, distinto camino para
+    # llegar ahí -- ver `execution.real_executor._leg_imbalance_pct` y CLAUDE.md,
+    # sección Fase 3, "Bug de sizing descubierto en la auditoría de la 4ta
+    # activación"). 2% da margen a redondeo normal de tick size sin dejar pasar
+    # un desbalance real como el observado (10.6%-24.2% en las 4 posiciones
+    # afectadas).
+    real_leg_imbalance_threshold_pct: float = _float_env("REAL_LEG_IMBALANCE_THRESHOLD_PCT", 0.02)
 
 
 settings = Settings()

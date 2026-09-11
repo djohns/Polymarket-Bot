@@ -88,6 +88,16 @@ class RealPosition(Base):
     resolución rápida). Mismo nivel de detalle que la posición simulada más
     los campos que sólo existen para una orden real: fee efectivamente
     cobrado por el exchange y los hashes de transacción on-chain de cada pata.
+
+    `yes_shares`/`no_shares` son la cantidad REAL confirmada de cada pata
+    (vía `execution.real_executor._confirmed_fill`, contra `get_trades`), no
+    una estimación pre-trade -- pueden diferir entre sí (`leg_imbalance_pct`
+    registra esa diferencia relativa). Antes de la migración del 2026-09-11
+    (ver `scripts/fix_real_position_leg_sizing_2026_09_11.py` y CLAUDE.md,
+    sección Fase 3) había un único campo `shares` compartido por ambas patas,
+    asumiendo una canasta siempre calzada -- resultó ser falso en las 4
+    posiciones que llegaron a ejecutar ambas patas desde el incidente del
+    2026-09-08 (10.6% a 24.2% de diferencia real entre YES y NO en las 4).
     """
 
     __tablename__ = "real_positions"
@@ -104,10 +114,16 @@ class RealPosition(Base):
     # una orden real podía llenar de verdad y no quedar registrada en ningún lado
     # si la señal de "llenó" fallaba) | "cancelada" (YES confirmado sin llenar,
     # nada de capital tocado) | "abierta" | "cerrada" | "pendiente" (leg imbalance
-    # o fallo de envío sin poder confirmar el resultado -- requiere revisión manual)
+    # total O desbalance residual de shares más allá del umbral -- ver
+    # `real_executor._leg_imbalance_pct` -- requiere revisión manual en ambos casos)
     status: Mapped[str] = mapped_column(String, default="enviada", index=True)
 
-    shares: Mapped[float] = mapped_column(Float)
+    yes_shares: Mapped[float] = mapped_column(Float)
+    no_shares: Mapped[float] = mapped_column(Float, default=0.0)
+    # Diferencia relativa entre yes_shares/no_shares (0.0 = perfectamente calzada),
+    # calculada una vez confirmado el fill real de ambas patas. `None` para
+    # posiciones que nunca llegaron a confirmar la pata NO (leg imbalance total).
+    leg_imbalance_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     yes_price_avg: Mapped[float] = mapped_column(Float)
     no_price_avg: Mapped[float] = mapped_column(Float)
     cost_usd: Mapped[float] = mapped_column(Float)

@@ -1139,28 +1139,111 @@ San Diego FC fue la primera vez que este bug produjo una divergencia lo
 bastante grande, con el kill-switch activo y sin otra causa compitiendo, como
 para hacerse notar por sí sola.
 
-**No se tocó código en esta investigación** (pedido explícito) -- el fix
-correcto (persistir en `RealPosition` los montos confirmados por
-`get_trades`/`_confirm_via_trades` en vez de la estimación de
-`simulate_arbitrage_fill`, y que `real_resolution_job.py` calcule
-`realized_pnl` sobre el tamaño real de cada pata en vez de asumir simetría)
-queda pendiente para una sesión futura, no autorizado todavía.
+### Auditoría de alcance completo (2026-09-11) -- confirmado: bug de diseño en el sizing, no sólo de registro
+
+Antes de tocar código, se auditó el alcance real reconstruyendo el flujo de
+caja on-chain exacto de las 8 posiciones reales (`data-api.polymarket.com/
+activity`, `type=TRADE,REDEEM`, filtrado por la proxy wallet y cada
+`conditionId`) -- no la estimación pre-trade que `real_positions` guardaba.
+Resultado:
+
+- **P&L real acumulado del proyecto: +$0.2532**, no +$0.5959 (lo que mostraba
+  `real_positions` antes del backfill de abajo).
+- De las 4 posiciones que llegaron a ejecutar ambas patas desde el incidente
+  del 2026-09-08 (Santa Fe, HJK Helsinki, Barcelona/Feyenoord, San Diego FC),
+  **las 4 terminaron con `yes_shares` ≠ `no_shares` reales** (10.6% a 24.2% de
+  diferencia) -- no fue un evento aislado de San Diego FC.
+- **Causa raíz confirmada como bug de sizing/ejecución, no sólo de registro
+  post-trade**: `real_executor.py` calculaba un único `fill.shares` objetivo
+  (`simulate_arbitrage_fill`, caminando el book LOCAL del WS una sola vez,
+  antes de mandar cualquier orden) y de ahí derivaba dos presupuestos en
+  dólares independientes (`yes_budget`/`no_budget`). `MarketOrderArgsV2.amount`
+  para una orden BUY es un monto en dólares, no una cantidad de shares (el SDK
+  no ofrece "comprar exactamente N shares" para el lado BUY) -- así que la
+  cantidad REAL de shares que entrega cada pata es `presupuesto /
+  precio_real_de_ejecución`, y ese precio puede diferir del estimado,
+  especialmente en la pata NO (enviada segunda, después de confirmar YES, con
+  el book ya movido -- consistente con operar en mercados deportivos de
+  resolución rápida justo cuando el precio se mueve rápido hacia el resultado
+  real). El sistema creía tener una canasta de arb sin riesgo cuando en
+  realidad dejaba una porción sin cobertura, sin ninguna alerta en el momento.
+
+### Rediseño de la ejecución real (2026-09-11)
+
+Cuatro cambios, todos en el mismo commit -- no un parche cosmético:
+
+1. **La pata NO ya no se dimensiona con un presupuesto independiente**:
+   `real_executor.py::_execute_fill` primero confirma el tamaño REAL de la
+   pata YES (`_confirmed_fill`, vía `get_trades` filtrado por `taker_order_id`
+   -- misma fuente ya validada para detección de fill en el incidente del
+   2026-09-08, ahora también usada para leer `size`/`price`), y recién con ese
+   número dimensiona la pata NO: camina el book de NO **en vivo**
+   (`_fresh_asks`, `client.get_order_book`, no el book local del WS que puede
+   estar desatrasado a esta altura) para calcular el presupuesto que cubre
+   exactamente esa cantidad de shares (`_cost_for_target_shares`). Esto reduce
+   el desbalance esperado pero no lo elimina -- el book de NO puede seguir
+   moviéndose entre esa consulta y el envío real, y el SDK sigue sin aceptar
+   una cantidad de shares exacta para BUY.
+2. **Red de seguridad post-fill**: después de confirmar el fill real de AMBAS
+   patas, `_leg_imbalance_pct(yes_shares, no_shares)` calcula la diferencia
+   relativa. Si supera `REAL_LEG_IMBALANCE_THRESHOLD_PCT` (default 2%, margen
+   sobre redondeo normal de tick size), se trata con la MISMA severidad que un
+   leg imbalance total: `status="pendiente"`, evento `leg_size_mismatch`
+   crítico persistido, y `kill_switch.halt()` -- es el mismo riesgo de fondo
+   (exposición direccional real sin cobertura completa), sólo que llega por un
+   camino distinto (ambas patas "llenan" según `_is_order_filled`, pero con
+   tamaños que no calzan) en vez de que una pata falle del todo.
+3. **Registro corregido**: `RealPosition.shares` (un único campo compartido,
+   asumiendo canasta siempre calzada) se reemplaza por `yes_shares`/
+   `no_shares` -- ambos AHORA con el valor real confirmado por `get_trades`,
+   no la estimación pre-trade. Se agrega `leg_imbalance_pct` (nullable -- sin
+   valor para un leg imbalance total, donde nunca se confirmó nada de NO).
+   `real_resolution_job.py` se simplifica a una única fórmula de payout,
+   `winning_shares - cost_usd` (`winning_shares` = `yes_shares` o `no_shares`
+   según qué lado ganó) -- ya no hace falta distinguir `status="abierta"` de
+   `"pendiente"` para elegir la fórmula, porque usar las shares reales de cada
+   lado cubre ambos casos (y también el de leg imbalance total, donde
+   `no_shares=0` hace que el payout sea 0 si ganó ese lado).
+4. **Bug adicional encontrado al implementar el punto 1 -- el fee taker no
+   estaba en el `price` de `get_trades`**: comparando `price × size` contra el
+   `usdcSize` real de `data-api.polymarket.com/activity` para las 8
+   posiciones, la diferencia coincidía con `signals.fees.taker_fee(size,
+   price, market)` (~2-5% observado), no con cero -- el `price` que devuelve
+   el exchange es el precio de ejecución SIN fee. Sin sumarlo,
+   `_confirmed_fill` habría subestimado `cost_usd` en el monto del fee real,
+   reintroduciendo el mismo tipo de error que este rediseño corrige (esta vez
+   en el costo, no en las shares). Cubierto en
+   `test_real_cost_includes_taker_fee_not_just_price_times_shares`.
+
+**Backfill retroactivo de las 8 posiciones históricas**
+(`scripts/fix_real_position_leg_sizing_2026_09_11.py`, ejecutado una sola vez):
+migra el esquema (SQLite en la VPS es 3.34.1, anterior a `ALTER TABLE ... DROP
+COLUMN` de 3.35 -- la migración reconstruye la tabla entera con un backup
+previo del archivo completo) y corrige `yes_shares`/`no_shares`/`cost_usd`/
+`realized_pnl` de las 8 con los valores exactos reconstruidos del flujo de
+caja on-chain (`usdcSize`, no `price × size` -- mismo fix del punto 4 de
+arriba). El script verifica al final que el P&L total quede en +$0.2532; se
+deja en el repo como referencia, no pensado para re-ejecutarse (falla si
+encuentra un id que no sea 1-8).
+
+**Tests**: `test_no_leg_sized_by_real_yes_shares_not_fixed_budget` (la pata NO
+se dimensiona por las shares reales de YES, no por la estimación pre-trade),
+`test_residual_leg_size_mismatch_beyond_threshold_halts_like_leg_imbalance`
+(ambas patas "llenan" pero con tamaños que no calzan > umbral -> kill-switch +
+`status="pendiente"`, igual que un leg imbalance total),
+`test_real_cost_includes_taker_fee_not_just_price_times_shares` (punto 4), más
+`test_resolved_residual_mismatch_position_pays_winning_side_real_shares` en
+`test_execution_real_resolution_job.py` (la fórmula unificada de payout usa
+las shares reales del lado ganador, no un promedio).
 
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
   puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
-  explícita del usuario. Esta sería la quinta activación.
-- **Nuevo, agregado en la investigación del patrón de divergencia #3**:
-  corregir `real_executor.py` para persistir `shares`/`yes_price_avg`/
-  `no_price_avg` desde el fill realmente confirmado (no la estimación
-  pre-trade), y `real_resolution_job.py` para calcular `realized_pnl` sobre
-  el tamaño real de cada pata (no asumir canasta simétrica) -- sin esto, el
-  P&L real reportado por el sistema no es confiable pata por pata, aunque el
-  balance total termine coincidiendo en la reconciliación por casualidad de
-  cancelación entre errores (como pasó acá: HJK y Barcelona subestimados
-  compensaron parcialmente el error de San Diego FC).
+  explícita del usuario, con el mismo nivel de escrutinio que las veces
+  anteriores (o más, dado que este bug de sizing fue más fundamental que los
+  anteriores). Esta sería la quinta activación.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 

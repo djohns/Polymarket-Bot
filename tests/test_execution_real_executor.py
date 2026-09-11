@@ -22,6 +22,18 @@ SPORTS_MARKET = MarketInfo(
     sports_market_type="moneyline",
 )
 
+SPORTS_MARKET_WITH_FEE = MarketInfo(
+    condition_id="0xsportfee",
+    question="¿Gana el local? (con fee)",
+    yes_token_id="yesfee",
+    no_token_id="nofee",
+    fee_rate=0.05,
+    fee_exponent=1.0,
+    fees_enabled=True,
+    cluster_id="event-fee",
+    sports_market_type="moneyline",
+)
+
 NON_SPORTS_MARKET = MarketInfo(
     condition_id="0xlong",
     question="¿Habrá acuerdo?",
@@ -50,22 +62,28 @@ class FakeClient:
     `order_status_responses` (opcional, por orderID) simula `get_order` -- si un
     orderID no tiene entrada, `get_order` lanza (simula que la consulta falla).
     `trades` (opcional) simula `get_trades` -- lista de dicts con al menos
-    `taker_order_id` y `status`; por default vacía (simula que get_trades no
-    encuentra nada, igual que un cliente sin ese método haría fallar la
-    consulta)."""
+    `taker_order_id` y `status` (y opcionalmente `size`/`price` reales, usados
+    por `_confirmed_fill` para el tamaño real de cada pata -- sin ellos cae al
+    fallback pre-trade, igual que si `get_trades` no encontrara nada). `asks`
+    (opcional, por token_id) simula `get_order_book` para el sizing en vivo de
+    la pata NO -- por default un solo nivel amplio a 0.50, suficiente para no
+    limitar la profundidad en los tests que no la ejercitan a propósito."""
 
     def __init__(
         self,
         order_responses: list[dict],
         order_status_responses: dict | None = None,
         trades: list[dict] | None = None,
+        asks: dict[str, list[dict]] | None = None,
     ) -> None:
         self._order_responses = list(order_responses)
         self._order_status_responses = order_status_responses or {}
         self._trades = trades if trades is not None else []
+        self._asks = asks or {}
         self.calls: list[tuple] = []
         self.get_order_calls: list[str] = []
         self.get_trades_calls: list[dict] = []
+        self.get_order_book_calls: list[str] = []
 
     def create_and_post_market_order(self, order_args, order_type=None):
         self.calls.append((order_args.token_id, order_args.amount))
@@ -80,6 +98,10 @@ class FakeClient:
     def get_trades(self, params, only_first_page=False):
         self.get_trades_calls.append({"asset_id": params.asset_id})
         return self._trades
+
+    def get_order_book(self, token_id: str) -> dict:
+        self.get_order_book_calls.append(token_id)
+        return {"asks": self._asks.get(token_id, [{"price": "0.50", "size": "1000"}])}
 
 
 def _enable_real_trading(request, tmp_path):
@@ -248,8 +270,9 @@ def test_confirmed_filled_via_get_trades_matches_real_incident_scenario(request,
 
     engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
 
-    assert len(client.get_trades_calls) == 1
-    assert client.get_trades_calls[0]["asset_id"] == "yes"
+    # get_trades se llama más de una vez ahora (detección de fill + tamaño real
+    # confirmado de cada pata vía `_confirmed_fill`), pero sigue consultando "yes".
+    assert {c["asset_id"] for c in client.get_trades_calls} == {"yes", "no"}
     with session_factory() as session:
         positions = session.execute(select(RealPosition)).scalars().all()
         assert positions[0].status == "abierta"
@@ -314,6 +337,122 @@ def test_leg_imbalance_halts_trading_and_flags_position(request, tmp_path):
         positions = session.execute(select(RealPosition)).scalars().all()
         assert len(positions) == 1
         assert positions[0].status == "pendiente"
+
+
+def test_no_leg_sized_by_real_yes_shares_not_fixed_budget(request, tmp_path):
+    """Reproduce el bug de sizing descubierto en la auditoría de la 4ta
+    activación (ver CLAUDE.md, sección Fase 3): antes, la pata NO se mandaba
+    con un presupuesto derivado de la estimación PRE-TRADE (`fill.shares`),
+    sin importar cuánto había llenado realmente la pata YES. Acá el fill real
+    de YES (vía `get_trades`, size=5.0 a precio 0.44) difiere de la estimación
+    pre-trade (~5.56 shares a 0.40) -- la pata NO debe dimensionarse por las
+    5.0 shares reales de YES (caminando el book de NO en vivo, get_order_book),
+    no por la estimación."""
+    _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": [], "orderID": "yes-order"},
+            {"transactionsHashes": [], "orderID": "no-order"},
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.44"},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": "5.0", "price": "0.50"},
+        ],
+        asks={"no": [{"price": "0.50", "size": "1000"}]},
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert len(client.calls) == 2
+    no_token, no_budget = client.calls[1]
+    assert no_token == "no"
+    # 5.0 shares reales de YES x 0.50 (book de NO en vivo) = 2.50 -- NO la
+    # estimación pre-trade (~5.56 shares x 0.50 = ~2.78).
+    assert abs(no_budget - 2.5) < 1e-6
+
+    with session_factory() as session:
+        positions = session.execute(select(RealPosition)).scalars().all()
+        assert positions[0].yes_shares == 5.0
+        assert positions[0].status == "abierta"
+
+
+def test_residual_leg_size_mismatch_beyond_threshold_halts_like_leg_imbalance(request, tmp_path):
+    """Ambas patas "llenan" (transactionsHashes presente en las dos), pero con
+    tamaños reales que no calzan (5.0 vs. 4.0, 20% de diferencia > el umbral
+    de 2%) -- mismo riesgo que un leg imbalance total (exposición direccional
+    real sin cobertura completa), así que debe tratarse igual: kill-switch +
+    status="pendiente", no asumir canasta calzada."""
+    flag = _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+            {"transactionsHashes": ["0xno"], "orderID": "no-order"},
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": "4.0", "price": "0.50"},
+        ],
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert kill_switch.is_halted(str(flag)) is True
+    with session_factory() as session:
+        positions = session.execute(select(RealPosition)).scalars().all()
+        assert len(positions) == 1
+        pos = positions[0]
+        assert pos.status == "pendiente"
+        assert pos.yes_shares == 5.0
+        assert pos.no_shares == 4.0
+        assert abs(pos.leg_imbalance_pct - 0.20) < 1e-9
+        assert "desbalance" in pos.notes.lower() or "no quedó calzada" in pos.notes.lower()
+
+
+def test_real_cost_includes_taker_fee_not_just_price_times_shares(request, tmp_path):
+    """`get_trades` devuelve el precio de ejecución SIN fee (verificado en la
+    auditoría de la 4ta activación contra `usdcSize` de data-api) -- si
+    `_confirmed_fill` no sumara `taker_fee`, `cost_usd` subestimaría el gasto
+    real de la wallet en el fee taker efectivo (~2-5% observado), reintroduciendo
+    el mismo tipo de error de registro que este módulo corrige, esta vez en el
+    costo en vez de en las shares."""
+    from polybot.signals.fees import taker_fee
+
+    _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    yes_shares, no_shares = 5.0, 5.0
+    yes_price, no_price = 0.40, 0.50
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+            {"transactionsHashes": ["0xno"], "orderID": "no-order"},
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": str(yes_shares), "price": str(yes_price)},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": str(no_shares), "price": str(no_price)},
+        ],
+        asks={"nofee": [{"price": str(no_price), "size": "1000"}]},
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(
+        SPORTS_MARKET_WITH_FEE, _book("yesfee", {yes_price: 100.0}), _book("nofee", {no_price: 100.0})
+    )
+
+    expected_cost = (
+        yes_shares * yes_price
+        + taker_fee(yes_shares, yes_price, SPORTS_MARKET_WITH_FEE)
+        + no_shares * no_price
+        + taker_fee(no_shares, no_price, SPORTS_MARKET_WITH_FEE)
+    )
+    with session_factory() as session:
+        positions = session.execute(select(RealPosition)).scalars().all()
+        assert positions[0].status == "abierta"
+        assert positions[0].cost_usd > yes_shares * yes_price + no_shares * no_price
+        assert abs(positions[0].cost_usd - expected_cost) < 1e-9
 
 
 def test_execution_events_are_persisted_to_db(request, tmp_path):

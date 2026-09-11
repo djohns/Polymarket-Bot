@@ -51,7 +51,7 @@ def test_expected_balance_subtracts_committed_capital():
         session.add(
             RealPosition(
                 market_id="0xa", cluster_id="c1", question="q", status="abierta",
-                shares=10, yes_price_avg=0.4, no_price_avg=0.5, cost_usd=5.0,
+                yes_shares=10, no_shares=10, yes_price_avg=0.4, no_price_avg=0.5, cost_usd=5.0,
                 fee_paid=0.1, net_pnl_expected=0.2,
             )
         )
@@ -68,7 +68,7 @@ def test_expected_balance_adds_back_realized_pnl_of_closed_positions():
         session.add(
             RealPosition(
                 market_id="0xa", cluster_id="c1", question="q", status="cerrada",
-                shares=10, yes_price_avg=0.4, no_price_avg=0.5, cost_usd=5.0,
+                yes_shares=10, no_shares=10, yes_price_avg=0.4, no_price_avg=0.5, cost_usd=5.0,
                 fee_paid=0.1, net_pnl_expected=0.2, realized_pnl=1.5,
             )
         )
@@ -89,7 +89,7 @@ def test_checkpoint_ignores_positions_opened_before_it():
             RealPosition(
                 market_id="0xold", cluster_id="c1", question="q", status="cerrada",
                 opened_at=dt.datetime(2026, 9, 8, 18, 0, tzinfo=dt.UTC),
-                shares=5, yes_price_avg=0.4, no_price_avg=0.0, cost_usd=2.0,
+                yes_shares=5, no_shares=5, yes_price_avg=0.4, no_price_avg=0.0, cost_usd=2.0,
                 fee_paid=0.0, net_pnl_expected=0.0, realized_pnl=-0.45,
             )
         )
@@ -107,7 +107,7 @@ def test_checkpoint_counts_positions_opened_after_it():
             RealPosition(
                 market_id="0xnew", cluster_id="c1", question="q", status="abierta",
                 opened_at=dt.datetime(2026, 9, 8, 23, 0, tzinfo=dt.UTC),
-                shares=5, yes_price_avg=0.4, no_price_avg=0.5, cost_usd=4.0,
+                yes_shares=5, no_shares=5, yes_price_avg=0.4, no_price_avg=0.5, cost_usd=4.0,
                 fee_paid=0.0, net_pnl_expected=0.1,
             )
         )
@@ -165,7 +165,7 @@ def test_resolved_position_via_job_does_not_cause_false_divergence(tmp_path):
             session.add(
                 RealPosition(
                     market_id="0xa", cluster_id="c1", question="q", status="cerrada",
-                    shares=10, yes_price_avg=0.4, no_price_avg=0.5, cost_usd=5.0,
+                    yes_shares=10, no_shares=10, yes_price_avg=0.4, no_price_avg=0.5, cost_usd=5.0,
                     fee_paid=0.1, net_pnl_expected=0.2, realized_pnl=0.06,
                     resolved_outcome="NO", resolved_at=None,
                 )
