@@ -76,6 +76,11 @@ class Settings:
     # `real_positions` implica que debería haber, antes de considerarlo una
     # señal de que algo quedó sin registrar (ver incidente del 2026-09-08).
     real_reconciliation_threshold_usd: float = _float_env("REAL_RECONCILIATION_THRESHOLD_USD", 0.50)
+    # Ventana de gracia asimétrica (2026-09-12, ver reconciliation.py y CLAUDE.md):
+    # sólo se aplica a divergencia POSITIVA con una posición "pendiente" en
+    # curso -- candidata a estar resolviendo justo en este momento (mismo
+    # patrón benigno de Santa Fe/Al Ittihad). Divergencia negativa nunca la usa.
+    real_reconciliation_grace_period_seconds: float = _float_env("REAL_RECONCILIATION_GRACE_PERIOD_SECONDS", 90.0)
     # Punto de referencia para la reconciliación: el balance real CONFIRMADO
     # (vía get_balance_allowance) al momento `REAL_BALANCE_CHECKPOINT_AT`,
     # asumiendo que en ese momento `real_positions` ya reflejaba todo lo

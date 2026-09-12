@@ -1322,13 +1322,128 @@ asume canasta calzada).
 **Variables nuevas en `.env`**: `REAL_FILL_CONFIRM_RETRIES` (3),
 `REAL_FILL_CONFIRM_RETRY_DELAY_SECONDS` (2.0).
 
+### Sexta y séptima activación (2026-09-11) — dos leg imbalance genuinos por falla de envío HTTP, sin bug de código
+
+Con el fix del fallback silencioso ya en producción, la 6ta activación
+ejecutó la primera posición real limpia del flujo completo sin incidentes en
+su propia ejecución, pero ~1 minuto después de abrirse la segunda posición
+del período (Al Ittihad Saudi Club, id 10), el kill-switch se activó por
+**leg imbalance real**: la pata YES llenó, pero la llamada HTTP que envía la
+pata NO lanzó una excepción (falla de red/cliente al conectar con el
+exchange, no un rechazo de la orden) -- exactamente el riesgo residual ya
+documentado desde el diseño original de Fase 3 ("dos llamadas HTTP
+separadas... no hay forma de que el exchange las ejecute atómicamente").
+`_handle_leg_imbalance` respondió correctamente: `status="pendiente"`,
+kill-switch activado, sin intentar deshacer ni reintentar solo. Por
+instrucción explícita del usuario, la posición se dejó para resolución
+natural (no venderla manualmente) -- resolvió sola con YES ganador
+(`realized_pnl=+$0.5173`).
+
+La 7ma activación repitió el mismo patrón dos veces más, ninguna por bug de
+código:
+- Un kill-switch por **divergencia de reconciliación** (patrón ya conocido,
+  ver Santa Fe/HJK abajo): el dinero de la redención de Al Ittihad ya había
+  vuelto a la wallet antes de que `real_resolution_job` alcanzara a marcar
+  la posición "cerrada" (el job corre cada `RESOLUTION_CHECK_INTERVAL_SECONDS`,
+  15 min por defecto) -- se autoresolvió apenas el job corrió, sin ninguna
+  acción manual.
+- Un segundo **leg imbalance real** (CA Boca Juniors, id 11), mismo patrón
+  exacto que Al Ittihad: pata YES llenó, la llamada HTTP de la pata NO
+  lanzó una excepción. Resolvió sola con YES ganador
+  (`realized_pnl=+$0.7010`).
+
+### Auditoría de estado (2026-09-12) — 11 posiciones reales, P&L +$1.13, 7 kill-switch en total
+
+Auditoría de solo lectura sobre las 11 posiciones reales hasta la fecha:
+**P&L acumulado +$1.1278**, hit rate 6 ganadas / 5 perdidas (54.5%) sobre 11
+cerradas. De los **7 kill-switch disparados en total desde el 2026-09-08**:
+3 fueron bugs de código genuinos (sizing, fallback de `_confirmed_fill`,
+equity vs. balance líquido) -- los 3 corregidos y **ninguno volvió a
+repetirse** desde su fix; los 4 restantes son 2 patrones de riesgo residual
+ya reconocidos y aceptados por diseño (2x lag de reconciliación benigno:
+Santa Fe, Al Ittihad; 2x leg imbalance por falla de envío HTTP: Al Ittihad,
+Boca Juniors) -- ninguno dejó una posición mal contabilizada, los 4 se
+autoresolvieron correctamente. Conclusión: la lógica de ejecución es
+confiable con evidencia real repetida, pero el patrón operativo (el sistema
+se detiene solo cada pocas horas por causas ya conocidas y benignas)
+todavía exige reactivación manual frecuente -- alta carga operativa, no un
+problema de confiabilidad de fondo.
+
+### Reducción de ruido operativo (2026-09-12) — tolerancia asimétrica en reconciliación + gap de logging cerrado
+
+Dos mejoras para reducir los cortes por los patrones benignos ya
+identificados, sin tocar el mecanismo del leg imbalance por falla de envío
+(ese sigue sin base segura para auto-recuperar -- no se sabe con certeza el
+estado real de la pata NO, a diferencia de la reconciliación donde sí se
+puede volver a consultar el balance real).
+
+**1. Ventana de gracia asimétrica para reconciliación**
+(`execution/reconciliation.py::check_balance_reconciliation_with_grace`,
+usada ahora en `main.py::real_balance_kill_switch_loop` en vez de la versión
+sin gracia): si la divergencia es **POSITIVA** (sobra plata) Y hay al menos
+una `RealPosition` en `status="pendiente"` (candidata a estar resolviendo
+justo ahora), en vez de activar el kill-switch de inmediato se espera
+`REAL_RECONCILIATION_GRACE_PERIOD_SECONDS` (default 90s) y se vuelve a
+chequear **una sola vez** con un balance fresco y el estado actualizado de
+`real_positions`; si para entonces el job ya cerró la posición, no se hace
+nada. **La asimetría es deliberada y crítica**: una divergencia **NEGATIVA**
+(falta plata) nunca recibe este margen -- dispara el kill-switch de
+inmediato siempre, sin excepción, sin importar si hay posiciones
+pendientes, porque ese es exactamente el signo del incidente original del
+2026-09-08 (una pérdida real o un bug nuevo, no un excedente que ya volvió).
+`check_balance_reconciliation` (sin gracia) se mantiene tal cual para uso
+directo/tests simples.
+
+- **Limitación conocida, no resuelta acá**: los dos casos reales observados
+  de este patrón (Santa Fe, Al Ittihad) tardaron **~10 minutos** en
+  autoresolverse, no 90 segundos -- porque `real_resolution_job` corre cada
+  `RESOLUTION_CHECK_INTERVAL_SECONDS` (900s/15min) y la ventana de gracia no
+  puede ser más rápida que ese job. Con el default de 90s, esta mejora
+  reduce el ruido de casos donde el job pasa a correr dentro de esa ventana
+  por coincidencia de timing, pero **no elimina el patrón por sí sola**
+  mientras el job de resolución siga en un ciclo de 15 minutos -- para
+  eliminarlo de verdad hace falta además acortar `RESOLUTION_CHECK_INTERVAL_SECONDS`
+  (la mejora futura ya anotada por el usuario, todavía no implementada,
+  "ventana de gracia o mayor frecuencia del job de resolución" -- resulta
+  que hacen falta las DOS, no una u otra).
+
+**2. Gap de logging cerrado** (`execution/event_log.py::log_event`): antes,
+`exc_info=True` sólo adjuntaba la traza al logger de Python (perdida con la
+rotación de journald, ~8.8MB en la VPS) pero nunca al `detail` JSON
+persistido en `real_execution_events` -- exactamente la misma clase de dato
+efímero que motivó crear esa tabla. Ahora `exc_info=True` además captura la
+excepción en curso (`sys.exc_info()`) y la mergea en `detail`
+(`exception_type`, `exception_message`, `traceback` completo) sin pisar
+ningún campo de `detail` ya provisto explícitamente. Aplica automáticamente
+a los dos `order_send_failed` de `real_executor.py` (ya pasaban
+`exc_info=True`) sin tocarlos -- la próxima falla de envío real (mismo
+patrón de Al Ittihad/Boca Juniors) va a dejar el tipo, mensaje y traceback
+completo de la excepción persistidos, no sólo en un journald que rota en
+horas.
+
+**Tests**: `test_positive_divergence_with_pending_position_self_heals_within_grace_window`,
+`test_positive_divergence_with_pending_position_halts_if_it_persists`,
+`test_negative_divergence_halts_immediately_even_with_pending_position`
+(la asimetría crítica -- nunca espera ante divergencia negativa, ni con
+posiciones pendientes), `test_positive_divergence_without_pending_position_halts_immediately`
+en `test_execution_reconciliation.py`; `test_exc_info_persists_exception_detail_not_just_the_log`,
+`test_exc_info_merges_with_explicit_detail_without_dropping_it` en el nuevo
+`test_execution_event_log.py`.
+
+**Variable nueva en `.env`**: `REAL_RECONCILIATION_GRACE_PERIOD_SECONDS` (90.0).
+
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
   puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
   explícita del usuario, con el mismo nivel de escrutinio que las veces
-  anteriores. Esta sería la sexta activación.
+  anteriores. Esta sería la octava activación.
+- Mejora futura ya anotada, no implementada: acortar
+  `RESOLUTION_CHECK_INTERVAL_SECONDS` (hoy 900s/15min) para que la ventana de
+  gracia de reconciliación (90s) realmente pueda alcanzar a cubrir el lag de
+  resolución observado (~10 min en los 2 casos reales) -- ver limitación
+  documentada arriba.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from contextlib import contextmanager
 
@@ -175,3 +176,161 @@ def test_resolved_position_via_job_does_not_cause_false_divergence(tmp_path):
             triggered = reconciliation.check_balance_reconciliation(session, 20.06)
         assert triggered is False
         assert not flag.exists()
+
+
+def _pending_position(**overrides) -> RealPosition:
+    defaults = {
+        "market_id": "0xpending", "cluster_id": "c1", "question": "q", "status": "pendiente",
+        "yes_shares": 5, "no_shares": 0, "yes_price_avg": 0.5, "no_price_avg": 0.0, "cost_usd": 5.0,
+        "fee_paid": 0.1, "net_pnl_expected": 0.0,
+    }
+    defaults.update(overrides)
+    return RealPosition(**defaults)
+
+
+def test_positive_divergence_with_pending_position_self_heals_within_grace_window(tmp_path):
+    """Escenario Santa Fe/Al Ittihad: la posición "pendiente" resuelve y el job
+    la cierra durante la ventana de gracia -- para el re-chequeo, la
+    divergencia ya desapareció y no debe activarse el kill-switch."""
+    session_factory = _session_factory()
+    flag = tmp_path / "HALT"
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_reconciliation_grace_period_seconds=90.0,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
+        with session_factory() as session:
+            pos = _pending_position()
+            session.add(pos)
+            session.commit()
+
+            sleep_calls: list[float] = []
+
+            async def fake_sleep(seconds: float) -> None:
+                sleep_calls.append(seconds)
+                # Simula que el job de resolución cerró la posición durante la espera.
+                pos.status = "cerrada"
+                pos.realized_pnl = 0.15
+                pos.cost_usd = 5.0
+                session.commit()
+
+            async def recheck_balance() -> float:
+                return 20.15  # balance ya reflejaba la redención
+
+            # expected antes: 20 - 5 (comprometido) = 15; actual=20 -> diff=+5, dispara la gracia
+            triggered = asyncio.run(
+                reconciliation.check_balance_reconciliation_with_grace(
+                    session, 20.0, recheck_balance=recheck_balance, sleep=fake_sleep
+                )
+            )
+        assert triggered is False
+        assert not flag.exists()
+        assert sleep_calls == [90.0]
+
+
+def test_positive_divergence_with_pending_position_halts_if_it_persists(tmp_path):
+    """Si la posición sigue "pendiente" tras la ventana de gracia (no fue el
+    lag benigno, o el job todavía no corrió), el kill-switch se activa igual
+    que antes -- la tolerancia no es un pase libre indefinido."""
+    session_factory = _session_factory()
+    flag = tmp_path / "HALT"
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_reconciliation_grace_period_seconds=90.0,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
+        with session_factory() as session:
+            session.add(_pending_position())
+            session.commit()
+
+            sleep_calls: list[float] = []
+
+            async def fake_sleep(seconds: float) -> None:
+                sleep_calls.append(seconds)  # nada cambia -- la posición sigue "pendiente"
+
+            async def recheck_balance() -> float:
+                return 20.0  # divergencia idéntica en el re-chequeo
+
+            triggered = asyncio.run(
+                reconciliation.check_balance_reconciliation_with_grace(
+                    session, 20.0, recheck_balance=recheck_balance, sleep=fake_sleep
+                )
+            )
+        assert triggered is True
+        assert kill_switch.is_halted(str(flag)) is True
+        assert sleep_calls == [90.0]
+
+
+def test_negative_divergence_halts_immediately_even_with_pending_position(tmp_path):
+    """CRÍTICO: la asimetría es a propósito -- una divergencia NEGATIVA (falta
+    plata) nunca recibe el margen de espera, sin importar si hay una posición
+    "pendiente" en curso. Podría ser una pérdida real o un bug nuevo (mismo
+    signo que el incidente del 2026-09-08)."""
+    session_factory = _session_factory()
+    flag = tmp_path / "HALT"
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_reconciliation_grace_period_seconds=90.0,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
+        with session_factory() as session:
+            session.add(_pending_position())
+            session.commit()
+
+            sleep_calls: list[float] = []
+
+            async def fake_sleep(seconds: float) -> None:
+                sleep_calls.append(seconds)
+
+            async def recheck_balance() -> float:
+                raise AssertionError("no debería recheckear una divergencia negativa")
+
+            # expected = 20 - 5 = 15; actual=11 -> diff=-4, negativa
+            triggered = asyncio.run(
+                reconciliation.check_balance_reconciliation_with_grace(
+                    session, 11.0, recheck_balance=recheck_balance, sleep=fake_sleep
+                )
+            )
+        assert triggered is True
+        assert kill_switch.is_halted(str(flag)) is True
+        assert sleep_calls == []  # nunca esperó
+
+
+def test_positive_divergence_without_pending_position_halts_immediately(tmp_path):
+    """Sin ninguna posición "pendiente", no hay candidata a estar resolviendo
+    ahora mismo -- la tolerancia no aplica aunque la divergencia sea positiva."""
+    session_factory = _session_factory()
+    flag = tmp_path / "HALT"
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_reconciliation_grace_period_seconds=90.0,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
+        with session_factory() as session:
+            sleep_calls: list[float] = []
+
+            async def fake_sleep(seconds: float) -> None:
+                sleep_calls.append(seconds)
+
+            async def recheck_balance() -> float:
+                raise AssertionError("no debería recheckear sin posiciones pendientes")
+
+            triggered = asyncio.run(
+                reconciliation.check_balance_reconciliation_with_grace(
+                    session, 25.0, recheck_balance=recheck_balance, sleep=fake_sleep
+                )
+            )
+        assert triggered is True
+        assert sleep_calls == []
