@@ -197,7 +197,7 @@ def test_positive_divergence_with_pending_position_self_heals_within_grace_windo
     with _override(
         real_capital_base_usd=20.0,
         real_reconciliation_threshold_usd=0.50,
-        real_reconciliation_grace_period_seconds=90.0,
+        real_reconciliation_grace_period_seconds=240.0,
         real_kill_switch_flag_path=str(flag),
         real_balance_checkpoint_usd=None,
         real_balance_checkpoint_at=None,
@@ -228,7 +228,7 @@ def test_positive_divergence_with_pending_position_self_heals_within_grace_windo
             )
         assert triggered is False
         assert not flag.exists()
-        assert sleep_calls == [90.0]
+        assert sleep_calls == [240.0]
 
 
 def test_positive_divergence_with_pending_position_halts_if_it_persists(tmp_path):
@@ -240,7 +240,7 @@ def test_positive_divergence_with_pending_position_halts_if_it_persists(tmp_path
     with _override(
         real_capital_base_usd=20.0,
         real_reconciliation_threshold_usd=0.50,
-        real_reconciliation_grace_period_seconds=90.0,
+        real_reconciliation_grace_period_seconds=240.0,
         real_kill_switch_flag_path=str(flag),
         real_balance_checkpoint_usd=None,
         real_balance_checkpoint_at=None,
@@ -264,7 +264,7 @@ def test_positive_divergence_with_pending_position_halts_if_it_persists(tmp_path
             )
         assert triggered is True
         assert kill_switch.is_halted(str(flag)) is True
-        assert sleep_calls == [90.0]
+        assert sleep_calls == [240.0]
 
 
 def test_negative_divergence_halts_immediately_even_with_pending_position(tmp_path):
@@ -277,7 +277,7 @@ def test_negative_divergence_halts_immediately_even_with_pending_position(tmp_pa
     with _override(
         real_capital_base_usd=20.0,
         real_reconciliation_threshold_usd=0.50,
-        real_reconciliation_grace_period_seconds=90.0,
+        real_reconciliation_grace_period_seconds=240.0,
         real_kill_switch_flag_path=str(flag),
         real_balance_checkpoint_usd=None,
         real_balance_checkpoint_at=None,
@@ -313,7 +313,7 @@ def test_positive_divergence_without_pending_position_halts_immediately(tmp_path
     with _override(
         real_capital_base_usd=20.0,
         real_reconciliation_threshold_usd=0.50,
-        real_reconciliation_grace_period_seconds=90.0,
+        real_reconciliation_grace_period_seconds=240.0,
         real_kill_switch_flag_path=str(flag),
         real_balance_checkpoint_usd=None,
         real_balance_checkpoint_at=None,

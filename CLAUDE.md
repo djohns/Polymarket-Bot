@@ -289,10 +289,13 @@ tests/
   mercado real ya resuelto) es el outcome ganador. Si está `closed=True` pero
   ningún token (o más de uno) tiene `winner=True`, se trata como no resuelto
   todavía — oráculo o disputa en curso.
-- **Frecuencia del job**: `RESOLUTION_CHECK_INTERVAL_SECONDS` (default 900s /
-  15min). Los mercados tardan horas a días en resolver (propuesta UMA +
+- **Frecuencia del job**: `RESOLUTION_CHECK_INTERVAL_SECONDS` (default original
+  900s/15min, bajado a 180s/3min el 2026-09-12 -- ver Fase 3, sección
+  "Reducción de ruido operativo", por qué: coherencia con la ventana de
+  gracia de reconciliación de `RealPosition`, no un cambio de este análisis
+  de Fase 2). Los mercados tardan horas a días en resolver (propuesta UMA +
   ventana de disputa ~2h, o 4-6 días si escala al DVM — ver informe técnico),
-  así que no hace falta pollear más seguido; se prioriza no gastar cuota de
+  así que no hacía falta pollear más seguido en su momento; se priorizaba no gastar cuota de
   API ni ciclos de CPU en un proceso ya ajustado de RAM.
 - **No bloquea el loop de ingesta/detección**: el job corre en el mismo
   event loop (mismo proceso, `asyncio.create_task` separado del loop de
@@ -1394,18 +1397,22 @@ pendientes, porque ese es exactamente el signo del incidente original del
 `check_balance_reconciliation` (sin gracia) se mantiene tal cual para uso
 directo/tests simples.
 
-- **Limitación conocida, no resuelta acá**: los dos casos reales observados
-  de este patrón (Santa Fe, Al Ittihad) tardaron **~10 minutos** en
-  autoresolverse, no 90 segundos -- porque `real_resolution_job` corre cada
-  `RESOLUTION_CHECK_INTERVAL_SECONDS` (900s/15min) y la ventana de gracia no
-  puede ser más rápida que ese job. Con el default de 90s, esta mejora
-  reduce el ruido de casos donde el job pasa a correr dentro de esa ventana
-  por coincidencia de timing, pero **no elimina el patrón por sí sola**
-  mientras el job de resolución siga en un ciclo de 15 minutos -- para
-  eliminarlo de verdad hace falta además acortar `RESOLUTION_CHECK_INTERVAL_SECONDS`
-  (la mejora futura ya anotada por el usuario, todavía no implementada,
-  "ventana de gracia o mayor frecuencia del job de resolución" -- resulta
-  que hacen falta las DOS, no una u otra).
+- **Ajustado el 2026-09-12 para que los dos intervalos sean coherentes entre
+  sí** (la limitación detectada en la primera versión de esta mejora: un
+  default de 90s de gracia contra un job de resolución de 15min no podía
+  cubrir el lag real observado de ~10min en los 2 casos, Santa Fe/Al
+  Ittihad): `RESOLUTION_CHECK_INTERVAL_SECONDS` baja de 900s a **180s**
+  (3min) -- es una consulta liviana de sólo lectura por posición real
+  abierta/pendiente, sin costo real de correrla más seguido, y de paso
+  acelera el cierre de TODAS las posiciones resueltas (reales y simuladas),
+  no sólo las afectadas por este patrón. `REAL_RECONCILIATION_GRACE_PERIOD_SECONDS`
+  sube de 90s a **240s** (4min) -- con el job corriendo cada 3min, un margen
+  de 4min cubre el peor caso razonable (una resolución que ocurre justo
+  después de que el job arrancó su ciclo anterior) con buffer, sin necesitar
+  que ambos números coincidan exactamente. Los dos valores no pueden
+  ajustarse por separado sin que uno vuelva ineficaz al otro -- documentado
+  también como comentario en `config.py` y `.env.example` para que quede
+  explícito en el propio código, no sólo acá.
 
 **2. Gap de logging cerrado** (`execution/event_log.py::log_event`): antes,
 `exc_info=True` sólo adjuntaba la traza al logger de Python (perdida con la
@@ -1430,7 +1437,9 @@ en `test_execution_reconciliation.py`; `test_exc_info_persists_exception_detail_
 `test_exc_info_merges_with_explicit_detail_without_dropping_it` en el nuevo
 `test_execution_event_log.py`.
 
-**Variable nueva en `.env`**: `REAL_RECONCILIATION_GRACE_PERIOD_SECONDS` (90.0).
+**Variable nueva en `.env`**: `REAL_RECONCILIATION_GRACE_PERIOD_SECONDS` (240.0,
+ver arriba por qué 240 y no 90). **Variable existente con default cambiado**:
+`RESOLUTION_CHECK_INTERVAL_SECONDS` (900 -> 180).
 
 ### Pendiente para la próxima activación
 
@@ -1439,11 +1448,6 @@ en `test_execution_reconciliation.py`; `test_exc_info_persists_exception_detail_
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
   explícita del usuario, con el mismo nivel de escrutinio que las veces
   anteriores. Esta sería la octava activación.
-- Mejora futura ya anotada, no implementada: acortar
-  `RESOLUTION_CHECK_INTERVAL_SECONDS` (hoy 900s/15min) para que la ventana de
-  gracia de reconciliación (90s) realmente pueda alcanzar a cubrir el lag de
-  resolución observado (~10 min en los 2 casos reales) -- ver limitación
-  documentada arriba.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
