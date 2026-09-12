@@ -327,14 +327,19 @@ async def real_balance_kill_switch_loop(client) -> None:
     se reusa para comparar contra lo que `real_positions` implica que debería
     haber, sin pagar una consulta HTTP extra.
     """
+    async def _fetch_balance_usd() -> float:
+        balance = await asyncio.to_thread(
+            client.get_balance_allowance, BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        return float(balance.get("balance", 0) or 0) / 1_000_000  # USDC, 6 decimales
+
     while True:
         try:
-            balance = await asyncio.to_thread(
-                client.get_balance_allowance, BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-            current_balance = float(balance.get("balance", 0) or 0) / 1_000_000  # USDC, 6 decimales
+            current_balance = await _fetch_balance_usd()
             with get_session() as session:
-                reconciliation.check_balance_reconciliation(session, current_balance)
+                await reconciliation.check_balance_reconciliation_with_grace(
+                    session, current_balance, recheck_balance=_fetch_balance_usd
+                )
                 kill_switch.check_balance_kill_switch(current_balance, session=session)
         except Exception:
             logger.exception("Fallo consultando balance real, se reintenta en el próximo ciclo")

@@ -56,7 +56,13 @@ class Settings:
     kelly_fraction: float = _float_env("KELLY_FRACTION", 0.25)
 
     # Fase 2: tracking de resolución real + Brier score
-    resolution_check_interval_seconds: int = _int_env("RESOLUTION_CHECK_INTERVAL_SECONDS", 900)
+    # Bajado de 900s a 180s el 2026-09-12: es una consulta liviana de sólo
+    # lectura, sin costo real de correrla más seguido, y el intervalo tiene
+    # que ser coherente con REAL_RECONCILIATION_GRACE_PERIOD_SECONDS (ver
+    # abajo) -- ambos gobiernan el mismo lag (cuánto tarda una posición real
+    # resuelta en quedar marcada "cerrada"), así que no pueden fijarse por
+    # separado sin que uno vuelva ineficaz al otro.
+    resolution_check_interval_seconds: int = _int_env("RESOLUTION_CHECK_INTERVAL_SECONDS", 180)
     resolution_stale_after_days: int = _int_env("RESOLUTION_STALE_AFTER_DAYS", 7)
 
     # Fase 2: dashboard (reporte HTML estático, regenerado por systemd timer -- no es un server vivo)
@@ -76,6 +82,15 @@ class Settings:
     # `real_positions` implica que debería haber, antes de considerarlo una
     # señal de que algo quedó sin registrar (ver incidente del 2026-09-08).
     real_reconciliation_threshold_usd: float = _float_env("REAL_RECONCILIATION_THRESHOLD_USD", 0.50)
+    # Ventana de gracia asimétrica (2026-09-12, ver reconciliation.py y CLAUDE.md):
+    # sólo se aplica a divergencia POSITIVA con una posición "pendiente" en
+    # curso -- candidata a estar resolviendo justo en este momento (mismo
+    # patrón benigno de Santa Fe/Al Ittihad). Divergencia negativa nunca la usa.
+    # 240s (4min) para ser coherente con RESOLUTION_CHECK_INTERVAL_SECONDS
+    # (180s/3min, ver arriba): con el job corriendo cada 3 min, un margen de
+    # 4 min cubre el peor caso razonable (una resolución que ocurre justo
+    # después de que el job arrancó su ciclo) con buffer.
+    real_reconciliation_grace_period_seconds: float = _float_env("REAL_RECONCILIATION_GRACE_PERIOD_SECONDS", 240.0)
     # Punto de referencia para la reconciliación: el balance real CONFIRMADO
     # (vía get_balance_allowance) al momento `REAL_BALANCE_CHECKPOINT_AT`,
     # asumiendo que en ese momento `real_positions` ya reflejaba todo lo
