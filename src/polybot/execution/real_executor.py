@@ -100,6 +100,24 @@ marca la posición `status="sin_confirmar"` (no "abierta" ni "pendiente" con
 un desbalance inventado) y dispara el kill-switch con la misma severidad que
 un leg imbalance: no se puede operar con confianza si ni siquiera se puede
 verificar el resultado de la posición anterior.
+
+**Prevención de leg imbalance por presupuesto infeasible (2026-09-13,
+incidente Getafe CF vs. RC Deportivo)**: pata YES llenó real ($4.29, mercado
+muy sesgado hacia YES), pero al enviar NO el exchange rechazó la orden de
+plano -- `"invalid amount for a marketable BUY order ($0.52), min size: 1"`.
+El presupuesto de NO (dimensionado por las shares reales de YES contra un
+book de NO muy barato, ~$0.11) cayó bajo el mínimo de orden del exchange.
+A diferencia de Al Ittihad/Boca Juniors (fallas de red aleatorias), esto es
+**determinístico**: va a volver a pasar cada vez que el mercado esté lo
+bastante sesgado como para que el lado barato, al tamaño que le toca cubrir,
+no llegue al mínimo. Fix: `_execute_fill` valida esto **antes de tocar
+YES** -- camina el book de NO en vivo con el tamaño ESTIMADO de YES
+(`fill.shares`, la única referencia disponible en este punto) y, si el
+presupuesto resultante cae bajo `REAL_MIN_ORDER_VALUE_USD`, aborta el trade
+completo sin gastar nada (mismo nivel que "no hay fill rentable"). No
+reemplaza `_handle_leg_imbalance` -- sigue siendo la red de seguridad para
+los casos que pasan esta validación previa pero fallan por otra razón en el
+envío real (ver docstring de esa función).
 """
 from __future__ import annotations
 
@@ -405,6 +423,37 @@ class RealExecutionEngine:
 
     def _execute_fill(self, session: Session, market: MarketInfo, fill) -> None:
         yes_budget = fill.shares * fill.yes_price_avg
+
+        # Validación de feasibility ANTES de gastar capital en YES (2026-09-13,
+        # incidente Getafe/Deportivo -- ver docstring del módulo y CLAUDE.md):
+        # en un mercado muy sesgado (una pata carísima, la otra muy barata),
+        # el presupuesto que le tocaría a la pata NO puede caer bajo el
+        # mínimo de orden que exige el exchange -- la orden se rechaza de
+        # plano y YES queda comprado sin cobertura posible, un leg imbalance
+        # evitable. Se estima acá con el book de NO EN VIVO y el tamaño
+        # ESTIMADO de YES (`fill.shares`, la única referencia disponible
+        # antes de enviar nada real) -- no reemplaza la red de seguridad de
+        # `_handle_leg_imbalance`, que sigue cubriendo los casos que pasan
+        # esta validación pero fallan por otra razón en el envío real (ej.
+        # las fallas de red de Al Ittihad/Boca Juniors). Sin margen de
+        # tolerancia agregado a propósito: es sólo una estimación pre-trade
+        # (el book puede moverse para cuando YES confirme), así que sumar un
+        # colchón arbitrario sería otra suposición sin verificar -- el riesgo
+        # residual de un caso límite que pase esta validación y aun así falle
+        # en el envío real queda cubierto por el leg imbalance existente.
+        estimated_no_asks = _fresh_asks(self._client, market.no_token_id)
+        estimated_no_budget, _ = _cost_for_target_shares(estimated_no_asks, fill.shares)
+        if estimated_no_budget < settings.real_min_order_value_usd:
+            logger.info(
+                "Arb infeasible en %s: presupuesto estimado de NO ($%.4f para %.4f shares) cae bajo "
+                "el mínimo de orden del exchange ($%.2f) -- mercado demasiado sesgado, se aborta antes "
+                "de tocar YES",
+                market.question[:60],
+                estimated_no_budget,
+                fill.shares,
+                settings.real_min_order_value_usd,
+            )
+            return
 
         position = RealPosition(
             market_id=market.condition_id,

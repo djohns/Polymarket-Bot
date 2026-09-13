@@ -130,6 +130,25 @@ class Settings:
     # sección Fase 3, "Bug de fallback silencioso en _confirmed_fill".
     real_fill_confirm_retries: int = _int_env("REAL_FILL_CONFIRM_RETRIES", 3)
     real_fill_confirm_retry_delay_seconds: float = _float_env("REAL_FILL_CONFIRM_RETRY_DELAY_SECONDS", 2.0)
+    # Piso de valor en dólares por debajo del cual el exchange rechaza una
+    # orden BUY de mercado -- confirmado con un rechazo real (2026-09-13,
+    # incidente Getafe/Deportivo): "invalid amount for a marketable BUY
+    # order ($0.52), min size: 1". NO es el mismo campo que `min_order_size`
+    # del order book (`get_order_book`, en SHARES, varía por mercado -- p.ej.
+    # 5 en otro mercado consultado en vivo -- y según la doc pública de
+    # Polymarket rige el tamaño de órdenes resting/límite, no la validación
+    # de una orden de mercado). No se pudo confirmar con 100% de certeza si
+    # "min size: 1" en el mensaje de error es realmente $1 fijo o coincide
+    # por casualidad con el `min_order_size` en shares de ESE mercado
+    # puntual (su book ya no existe para volver a consultarlo, el mercado
+    # resolvió) -- se eligió $1 por ser la lectura más literal del propio
+    # mensaje de error real observado ("amount ($0.52)... min size: 1", los
+    # dos en el mismo campo dólar) y por ser un mínimo ampliamente citado
+    # como constante de la plataforma Polymarket en general. Configurable
+    # para poder ajustarlo sin volver a tocar código si aparece evidencia de
+    # que varía por mercado como `min_order_size`. Ver CLAUDE.md, sección
+    # Fase 3, "Prevención de leg imbalance por presupuesto infeasible".
+    real_min_order_value_usd: float = _float_env("REAL_MIN_ORDER_VALUE_USD", 1.0)
 
 
 settings = Settings()

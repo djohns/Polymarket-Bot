@@ -407,6 +407,96 @@ def test_no_leg_sized_by_real_yes_shares_not_fixed_budget(request, tmp_path):
         assert positions[0].status == "abierta"
 
 
+def test_no_budget_below_minimum_aborts_before_touching_yes(request, tmp_path):
+    """Prevención agregada tras el incidente Getafe CF vs. RC Deportivo
+    (2026-09-13): si el book de NO en vivo está tan barato que el
+    presupuesto estimado para cubrir el tamaño esperado de YES cae bajo
+    `REAL_MIN_ORDER_VALUE_USD`, el exchange rechaza la orden de plano
+    ("invalid amount for a marketable BUY order... min size"). Hay que
+    abortar el trade completo ANTES de gastar nada en YES -- no dejar a YES
+    comprado sin ninguna posibilidad real de cubrirlo."""
+    _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [],  # no debería llegar a crear ninguna orden
+        asks={"no": [{"price": "0.05", "size": "1000"}]},  # NO muy barato en vivo
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    # yes=0.40 + no=0.50 (book local, para sizing) -> fill.shares ~= 5.56 al
+    # tope de $5.00 -- pero el book de NO EN VIVO cotiza a 0.05, dando un
+    # presupuesto estimado de ~$0.28, bajo el mínimo de $1.00.
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert client.calls == []  # nunca se envió ninguna orden real
+    with session_factory() as session:
+        positions = session.execute(select(RealPosition)).scalars().all()
+        assert positions == []  # ninguna posición registrada -- nunca se gastó capital
+
+
+def test_no_budget_above_minimum_proceeds_normally(request, tmp_path):
+    """Contraparte del test anterior -- si el presupuesto estimado de NO
+    supera el mínimo, la validación previa no debe bloquear un trade viable."""
+    _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+            {"transactionsHashes": ["0xno"], "orderID": "no-order"},
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.5556", "price": "0.40"},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": "5.5556", "price": "0.50"},
+        ],
+        asks={"no": [{"price": "0.50", "size": "1000"}]},
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert len(client.calls) == 2  # YES y NO se enviaron con normalidad
+    with session_factory() as session:
+        positions = session.execute(select(RealPosition)).scalars().all()
+        assert len(positions) == 1
+        assert positions[0].status == "abierta"
+
+
+def test_no_tolerance_margin_added_to_the_minimum_threshold(request, tmp_path):
+    """No se agrega ningún colchón de tolerancia a `REAL_MIN_ORDER_VALUE_USD`
+    a propósito (ver docstring de `_execute_fill`): es sólo una estimación
+    pre-trade contra el book en vivo, agregar un margen arbitrario sería
+    otra suposición sin verificar -- el leg imbalance existente sigue
+    cubriendo el residual. El chequeo es estrictamente "menor que" (no
+    "menor o igual que"), así que un presupuesto apenas por encima del
+    mínimo procede y uno apenas por debajo aborta, sin ninguna zona de
+    tolerancia intermedia agregada a propósito."""
+    _enable_real_trading(request, tmp_path)
+    fill_shares = 5.0 / 0.90  # yes=0.40 + no=0.50, tope $5.00
+
+    def _run(no_price: float) -> list:
+        session_factory = _session_factory()
+        client = FakeClient(
+            [
+                {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+                {"transactionsHashes": ["0xno"], "orderID": "no-order"},
+            ],
+            trades=[
+                {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": str(fill_shares), "price": "0.40"},
+                {"taker_order_id": "no-order", "status": "CONFIRMED", "size": str(fill_shares), "price": str(no_price)},
+            ],
+            asks={"no": [{"price": str(no_price), "size": "1000"}]},
+        )
+        engine = RealExecutionEngine(client, session_factory)
+        engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+        return client.calls
+
+    price_above = 1.05 / fill_shares  # presupuesto estimado ~$1.05 -> procede
+    assert len(_run(price_above)) == 2
+
+    price_below = 0.95 / fill_shares  # presupuesto estimado ~$0.95 -> aborta
+    assert _run(price_below) == []
+
+
 def test_residual_leg_size_mismatch_beyond_threshold_halts_like_leg_imbalance(request, tmp_path):
     """Ambas patas "llenan" (transactionsHashes presente en las dos), pero con
     tamaños reales que no calzan (5.0 vs. 4.0, 20% de diferencia > el umbral

@@ -1542,18 +1542,103 @@ sí distinga de forma consistente los dos desenlaces) -- no alcanza con
 volver a leer la documentación pública de `status`, ya se comprobó que no
 alcanza.
 
+### Novena activación (2026-09-13) — posición 14 (Manchester United) backfilleada en $0, y un nuevo leg imbalance determinístico
+
+La 9na activación ejecutó dos posiciones reales. La primera (id 13, Man Utd
+vs. Man City BTTS) se cerró sola sin incidentes (`realized_pnl=-$0.2992`).
+La segunda (id 14, Manchester United) fue el caso real que descartó el
+Paso 2 (ver sección "Octava activación" arriba) -- backfilleada una vez que
+el mercado resolvió: como la pata YES nunca tuvo capital real (0 trades
+confirmados, tanto vía `get_trades` como on-chain), `realized_pnl=$0.00`
+(no se compró nada, no se perdió nada) y `cost_usd` corregido de $5.00
+-- la estimación pre-trade nunca gastada -- a $0.00
+(`scripts/fix_position_14_manchester_united_2026_09_13.py`).
+
+### Décima activación (2026-09-13) — leg imbalance por presupuesto bajo el mínimo de orden del exchange (causa determinística, no aleatoria)
+
+La 10ma activación ejecutó una posición real (id 15, *"Will Getafe CF vs.
+RC Deportivo A Coruña end in a draw?"*): pata YES llenó real (4.7444 shares
+@ ~$0.904, `cost_usd=$4.29` -- mercado muy sesgado hacia el empate). Al
+enviar la pata NO, el exchange la **rechazó de plano** con un 400 -- ahora
+visible con el traceback completo gracias al fix de logging del incidente
+anterior:
+
+```
+PolyApiException[status_code=400, error_message={'error': 'invalid amount for a marketable BUY order ($0.52), min size: 1'}]
+```
+
+**A diferencia de Al Ittihad/Boca Juniors (fallas de red/cliente aleatorias),
+esto es determinístico**: el presupuesto calculado para NO ($0.52, dado que
+NO cotizaba muy barato, ~$0.11, con YES tan favorito) cayó bajo el mínimo de
+orden del exchange -- va a volver a pasar cada vez que el mercado esté lo
+bastante sesgado. La posición se resolvió sola (ganó YES, `realized_pnl=
++$0.4531`) vía el mecanismo de leg imbalance ya existente, que respondió
+correctamente -- pero el fix real es prevenir esto antes de gastar capital.
+
+**Investigación del "mínimo de orden" -- confirmado que NO es una constante
+fija, viene de un campo real del exchange**: `get_order_book` (usado ya para
+`_fresh_asks`) devuelve un campo `min_order_size` en su respuesta, verificado
+en vivo contra el servidor real -- **varía por mercado** (`5` en un mercado
+consultado en vivo durante esta investigación, evidencia empírica directa de
+que no es un valor fijo global). Sin embargo, **no se pudo confirmar con
+100% de certeza si ese campo (documentado como una cantidad en SHARES, para
+el tamaño de órdenes resting/límite según la documentación pública y una
+integración de terceros) es el mismo concepto que el "min size: 1" citado en
+el mensaje de rechazo de una orden BUY de MERCADO** (que valida sobre
+`amount`, un monto en DÓLARES) -- el book del mercado del incidente ya no
+existe (resolvió) para volver a consultarlo. Se eligió `REAL_MIN_ORDER_VALUE_USD=1.0`
+(configurable) por ser la lectura más literal del propio mensaje de error
+real observado (dólares, no shares) y por ser un mínimo ampliamente citado
+como constante de la plataforma Polymarket en general -- documentado como
+una decisión con incertidumbre residual, no una certeza verificada al 100%
+como el resto de las constantes de este proyecto (ver `config.py` para el
+detalle completo del razonamiento).
+
+**Fix -- validación de feasibility ANTES de gastar capital en YES**
+(`real_executor.py::_execute_fill`): con el book de NO EN VIVO ya disponible
+(`_fresh_asks`, la misma función ya usada para dimensionar la pata NO
+después de confirmar YES) y el tamaño ESTIMADO de YES (`fill.shares` --
+la única referencia posible antes de enviar nada real), se estima el
+presupuesto que le tocaría a NO. Si cae bajo `REAL_MIN_ORDER_VALUE_USD`, se
+aborta el trade completo **antes de tocar YES** -- mismo nivel que "no hay
+fill rentable" (`fill.net_pnl <= 0`), sin registrar ninguna posición ni
+gastar nada. **No reemplaza `_handle_leg_imbalance`**, que sigue como red de
+seguridad para los casos que pasan esta validación previa pero fallan por
+otra razón en el envío real (ej. las fallas de red de Al Ittihad/Boca
+Juniors) -- son dos capas complementarias, no una sustituyendo a la otra.
+**Sin margen de tolerancia agregado a propósito**: es sólo una estimación
+pre-trade (el book puede moverse para cuando YES confirme), así que sumar
+un colchón arbitrario sería otra suposición sin verificar -- el leg
+imbalance existente cubre el riesgo residual de un caso límite que pase
+esta validación y aun así falle en el envío real.
+
+**Tests**: `test_no_budget_below_minimum_aborts_before_touching_yes` (caso
+infeasible, ningún capital gastado, ninguna posición registrada),
+`test_no_budget_above_minimum_proceeds_normally` (contraparte -- no bloquea
+un trade viable), `test_no_tolerance_margin_added_to_the_minimum_threshold`
+(el chequeo es estrictamente "menor que", sin zona de tolerancia intermedia).
+
+**Variable nueva en `.env`**: `REAL_MIN_ORDER_VALUE_USD` (1.0 -- ver arriba
+la incertidumbre sobre si es fijo o varía por mercado).
+
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
   puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
   explícita del usuario, con el mismo nivel de escrutinio que las veces
-  anteriores. Esta sería la décima activación.
-- Backfill pendiente de la posición 14 (ver sección "Octava activación"
-  arriba, el ejemplo real que descartó el Paso 2): el partido *"Will
-  Manchester United FC win on 2026-09-13?"* seguía en curso al momento de
-  escribir esto -- corregir `status`/`realized_pnl` con el resultado real
-  (mismo patrón que AS Monaco FC/Kashiwa Reysol) apenas el mercado resuelva.
+  anteriores. Esta sería la undécima activación.
+- Seguir contando la frecuencia de `fill_not_confirmed` a través de las
+  activaciones (van 2 casos: AS Monaco FC y Manchester United, en 2
+  activaciones consecutivas) -- si aparece un 3er caso, evaluar si hay algo
+  sistemático más allá del riesgo residual ya aceptado (pedido explícito del
+  usuario).
+- Si en el futuro se confirma con certeza la unidad real de `min_order_size`
+  contra un caso real (ej. un rechazo similar donde el book todavía exista
+  para consultarlo), revisar si `REAL_MIN_ORDER_VALUE_USD` debería leerse
+  dinámicamente del propio `min_order_size` del book en vez de ser una
+  constante fija -- ver la incertidumbre documentada en la sección "Décima
+  activación" arriba.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
