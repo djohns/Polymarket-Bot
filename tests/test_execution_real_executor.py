@@ -552,6 +552,39 @@ def test_unconfirmed_fill_after_exhausting_retries_marks_sin_confirmar_and_halts
         event_types = {e.event_type for e in events}
         assert "fill_not_confirmed" in event_types
 
+        fill_not_confirmed = next(e for e in events if e.event_type == "fill_not_confirmed")
+        assert fill_not_confirmed.detail is not None
+        assert fill_not_confirmed.detail["raw_response"] == {"transactionsHashes": ["0xno"], "orderID": "no-order"}
+
+
+def test_unconfirmed_yes_fill_persists_raw_response_in_detail(request, tmp_path):
+    """Mismo camino que el de la pata NO, pero para YES -- el `detail` del
+    evento `fill_not_confirmed` debe traer la respuesta cruda de
+    `create_and_post_market_order` para esa pata (2026-09-13, incidente AS
+    Monaco FC: sin esto no queda ningún rastro de qué devolvió el exchange
+    para verificar si trae una señal temprana de "no matcheó")."""
+    flag = _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+        ],
+        trades_sequence=[[], [], []],  # YES, todos los reintentos vuelven vacíos
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert kill_switch.is_halted(str(flag)) is True
+    with session_factory() as session:
+        pos = session.execute(select(RealPosition)).scalars().one()
+        assert pos.status == "sin_confirmar"
+
+        events = session.execute(select(RealExecutionEvent)).scalars().all()
+        fill_not_confirmed = next(e for e in events if e.event_type == "fill_not_confirmed")
+        assert fill_not_confirmed.detail is not None
+        assert fill_not_confirmed.detail["raw_response"] == {"transactionsHashes": ["0xyes"], "orderID": "yes-order"}
+
 
 def test_execution_events_are_persisted_to_db(request, tmp_path):
     """Los eventos críticos quedan en la base, no sólo en journald (ver

@@ -486,7 +486,7 @@ class RealExecutionEngine:
             retry_delay_seconds=settings.real_fill_confirm_retry_delay_seconds,
         )
         if confirmed_yes is None:
-            self._handle_unconfirmed_fill(session, position, leg="YES")
+            self._handle_unconfirmed_fill(session, position, leg="YES", raw_response=yes_resp)
             return
         yes_shares_real, yes_price_real, yes_cost_real = confirmed_yes
         position.yes_shares = yes_shares_real
@@ -565,7 +565,7 @@ class RealExecutionEngine:
             retry_delay_seconds=settings.real_fill_confirm_retry_delay_seconds,
         )
         if confirmed_no is None:
-            self._handle_unconfirmed_fill(session, position, leg="NO")
+            self._handle_unconfirmed_fill(session, position, leg="NO", raw_response=no_resp)
             return
         no_shares_real, no_price_real, no_cost_real = confirmed_no
         position.no_shares = no_shares_real
@@ -638,7 +638,9 @@ class RealExecutionEngine:
             session=session,
         )
 
-    def _handle_unconfirmed_fill(self, session: Session, position: RealPosition, *, leg: str) -> None:
+    def _handle_unconfirmed_fill(
+        self, session: Session, position: RealPosition, *, leg: str, raw_response: dict | None = None
+    ) -> None:
         """`_confirmed_fill` agotó los reintentos sin encontrar el trade real de
         la pata `leg` -- no se puede saber con certeza cuánto llenó ni a qué
         precio. Se trata con la misma severidad que un leg imbalance (ver
@@ -646,7 +648,19 @@ class RealExecutionEngine:
         (ni que calzó, ni que no), se detiene el trading real para revisión
         manual. `yes_shares`/`no_shares`/`cost_usd` quedan en lo último que sí
         se confirmó (la estimación pre-trade si es la pata YES la que no se
-        pudo confirmar; el costo real de YES solo si fue la pata NO)."""
+        pudo confirmar; el costo real de YES solo si fue la pata NO).
+
+        `raw_response` (2026-09-13, incidente AS Monaco FC): la respuesta cruda
+        de `create_and_post_market_order` para la pata `leg`, persistida en
+        `detail` -- puramente diagnóstico, no cambia ninguna decisión. Antes de
+        esto no quedaba ningún rastro de qué devolvió el exchange en el
+        momento del envío para un caso "sin_confirmar" (a diferencia de
+        `order_send_failed`, que sí captura la excepción vía `exc_info`, este
+        camino no lanza ninguna -- la orden se envió "bien", sólo que
+        `get_trades` nunca encontró el trade real). Sirve para verificar en el
+        próximo caso si la respuesta trae alguna señal temprana de "no
+        matcheó" (`status`/`errorMsg`) que permita saltar los reintentos --
+        ver CLAUDE.md, sección Fase 3, investigación pendiente (Paso 2)."""
         position.status = "sin_confirmar"
         position.notes = (
             f"No se pudo confirmar el fill real de la pata {leg} tras reintentar "
@@ -664,6 +678,7 @@ class RealExecutionEngine:
             "tras reintentar -- posición marcada sin_confirmar, no se asume canasta calzada",
             market_id=position.market_id,
             real_position_id=position.id,
+            detail={"raw_response": raw_response} if raw_response is not None else None,
         )
         kill_switch.halt(
             f"fill sin confirmar en mercado {position.market_id} (pata {leg}) -- "

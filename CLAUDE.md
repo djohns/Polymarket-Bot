@@ -1441,13 +1441,87 @@ en `test_execution_reconciliation.py`; `test_exc_info_persists_exception_detail_
 ver arriba por qué 240 y no 90). **Variable existente con default cambiado**:
 `RESOLUTION_CHECK_INTERVAL_SECONDS` (900 -> 180).
 
+### Octava activación (2026-09-12) — tercer patrón de "sin_confirmar": una pata NO que nunca fue matched, no un lag transitorio
+
+La 8va activación ejecutó su primera posición real (id 12, "Will AS Monaco FC
+win on 2026-09-12?", 17:03:46 GMT): pata YES llenó real (6.659575 shares
+confirmadas), pata NO enviada sin excepción (no hay `order_send_failed`),
+pero `_confirmed_fill` agotó los 3 reintentos sin encontrar el trade vía
+`get_trades` -- `status="sin_confirmar"` + kill-switch, exactamente como
+diseñado tras el incidente de Kashiwa Reysol.
+
+**Investigado (sólo lectura) y confirmado que NO es el mismo patrón de
+Kashiwa Reysol**: consultado `get_trades` del token NO **horas después**,
+devuelve **cero trades en total** para ese token (no sólo ausente el
+nuestro) -- descarta lag de indexación transitorio. Confirmado con el flujo
+de caja on-chain real (`data-api.polymarket.com/activity`): el único trade
+que existe en todo el mercado es la compra YES. La pata NO genuinamente
+nunca fue matched por el exchange. El mercado ya había resuelto (`closed`,
+ganó "No") al momento de investigar, así que el resultado real se pudo
+calcular con certeza sin ambigüedad: sólo YES tiene capital real, y perdió
+-- pérdida total. Backfill retroactivo:
+`scripts/fix_position_12_as_monaco_fc_2026_09_12.py` (ejecutado una sola
+vez) -- `status="cerrada"`, `realized_pnl=-3.212945`.
+
+**Investigación pedida explícitamente -- ¿existe una señal temprana de "no
+matcheó" en la respuesta inmediata de `create_and_post_market_order` que
+permita saltar los 6 segundos de reintentos de `_confirmed_fill`?**
+Revisado el código fuente del SDK instalado (`py_clob_client_v2` 1.1.0): el
+cliente no interpreta ningún campo `status`/`errorMsg` de la respuesta cruda,
+sólo usa `transactionsHashes`/`tradeIDs` para decidir si vale la pena
+poll-ear `get_trades` (`_resolve_transactions_hashes`) -- cualquier señal más
+fina vive sin tipar en el JSON del servidor. La documentación pública de
+Polymarket sí describe un campo `status` (`live`/`matched`/`delayed`/
+`unmatched`) y `errorMsg`, y una integración de terceros (NautilusTrader,
+que ya resolvió este mismo problema para esta misma API) confirma que
+depende de un REST check acotado (~5s) igual que nuestro propio diseño --
+validación externa de que el patrón de reintentos no es una improvisación --
+y sugiere que existe *una* respuesta que prueba de forma inequívoca "FOK no
+matcheó" (probablemente vía `errorMsg`), aunque una `status` ausente/vacía
+la tratan igual de forma optimista (mismo criterio que nuestro propio
+`_is_order_filled`). **No se implementó ningún atajo con esto**: la fuente
+es documentación de terceros mediada por búsqueda, no una respuesta real
+capturada de nuestro propio sistema para verificar contra ella -- exactamente
+el tipo de ajuste apurado con baja certeza que ya costó caro antes (fallback
+de Kashiwa Reysol). Ver docstring de `_handle_unconfirmed_fill` para el plan
+de dos pasos.
+
+**Paso 1 implementado (aditivo, sin cambiar comportamiento)**:
+`_handle_unconfirmed_fill` ahora recibe `raw_response` (la respuesta cruda de
+`create_and_post_market_order` para la pata que no se pudo confirmar) y la
+persiste en `detail` del evento `fill_not_confirmed` -- antes no quedaba
+ningún rastro de qué devolvió el exchange en este camino (a diferencia de
+`order_send_failed`, que sí captura la excepción vía `exc_info`, acá no hay
+ninguna excepción que capturar: la orden se envió "bien", sólo que
+`get_trades` nunca encontró el trade). **Corrección a una afirmación previa
+del propio Claude Code**: se dijo que esto era "igual que ya hace
+`_handle_leg_imbalance`" -- resultó ser inexacto, `_handle_leg_imbalance`
+recibe `no_resp` pero nunca lo usa ni lo persiste (parámetro vestigial); no
+se tocó esa función en este cambio (fuera del alcance aprobado), queda
+anotado como gap separado por si se quiere cerrar más adelante. Cubierto en
+`tests/test_execution_real_executor.py`:
+`test_unconfirmed_fill_after_exhausting_retries_marks_sin_confirmar_and_halts`
+(extendido) y `test_unconfirmed_yes_fill_persists_raw_response_in_detail`
+(nuevo, cobertura de la pata YES que no existía antes).
+
+**Paso 2 -- pendiente, condicionado a capturar un caso real**: una vez que
+`detail.raw_response` capture un caso real de "no matcheó", confirmar ahí
+mismo si trae una señal inequívoca (`errorMsg`/`status`) y recién entonces
+agregar una vía rápida que la reconozca y salte directo a
+`_handle_leg_imbalance` sin gastar los reintentos. No implementar con el
+string inferido de documentación externa sin verificarlo primero.
+
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
   puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
   explícita del usuario, con el mismo nivel de escrutinio que las veces
-  anteriores. Esta sería la octava activación.
+  anteriores. Esta sería la novena activación.
+- Paso 2 de la investigación de FOK sin match (ver sección "Octava
+  activación" arriba): esperar a que `detail.raw_response` capture un caso
+  real de "no matcheó" antes de implementar cualquier atajo que salte los
+  reintentos de `_confirmed_fill`.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
