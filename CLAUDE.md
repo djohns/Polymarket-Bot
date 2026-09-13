@@ -1621,6 +1621,127 @@ un trade viable), `test_no_tolerance_margin_added_to_the_minimum_threshold`
 **Variable nueva en `.env`**: `REAL_MIN_ORDER_VALUE_USD` (1.0 -- ver arriba
 la incertidumbre sobre si es fijo o varía por mercado).
 
+### Auditoría de downtime (2026-09-13/14) — el sistema estuvo operable ~14% del tiempo, concentrado desproporcionadamente fuera del horario de mayor actividad
+
+Auditoría de solo lectura (SQL agregado, sin cambios de código) cruzando los
+11 `kill_switch_triggered` persistidos contra el `opened_at` de cada posición
+real: **downtime reconstruido ~86% del tiempo transcurrido del proyecto,
+uptime efectivo ~14% (cota superior optimista)** -- cada kill-switch requiere
+reactivación manual explícita sin importar cuán bien entendido esté el
+patrón que lo disparó. El pico de actividad deportiva real (14:00-20:00 GMT)
+coincide desproporcionadamente con los horarios en que más incidentes
+dispararon, componiendo la pérdida de oportunidades. De 251 mercados
+deportivos con señal de arb detectada que NO se ejecutaron, 104 (41%) nunca
+tuvieron ninguna ventana de uptime disponible. Esta auditoría motivó
+directamente la propuesta de auto-recuperación de abajo.
+
+### Auto-recuperación de "sin_confirmar" (2026-09-14) — implementada, con salvaguardas
+
+Con 3 casos ya confirmados con la MISMA huella exacta (AS Monaco FC,
+Manchester United, CR Flamengo -- `status="delayed"`, `success=true`, sin
+`errorMsg`, 0 trades reales confirmados incluso horas después), se
+automatizó el proceso de verificación que hasta ahora hacía un humano a
+mano. **Categorización completa de todos los tipos de kill-switch
+históricos, y por qué sólo "sin_confirmar" con esta huella se automatiza**:
+
+- **Nunca automatizar**: drawdown por equity real (no es un evento puntual
+  con un final limpio -- es una lectura sobre si la estrategia pierde plata
+  de verdad, siempre requiere juicio humano) y leg imbalance por falla de
+  red genuina al enviar (Al Ittihad, Boca Juniors -- ambiguos por
+  naturaleza, sin una huella tan específica y repetible como para justificar
+  automatizar con la misma evidencia que `sin_confirmar`). El caso Getafe/
+  Deportivo, aunque también pasó por el camino de leg imbalance, tenía una
+  causa DETERMINÍSTICA (rechazo explícito por mínimo de orden) ya prevenida
+  en origen por la validación de feasibility (ver sección "Décima
+  activación") -- no necesitaba auto-recuperación posterior, se previno antes.
+- **Reconciliación con divergencia de causa NO caracterizada**: debe seguir
+  disparando siempre sin excepción -- 2 de los 3 bugs de código reales de
+  este proyecto (sizing, fallback de `_confirmed_fill`) se descubrieron
+  justamente porque la reconciliación no tenía ningún atajo. Automatizar de
+  más acá anularía el rol que ya cumplió dos veces.
+- **`sin_confirmar` con huella exacta ya caracterizada**: sí se automatiza,
+  con las salvaguardas de abajo.
+
+**Reencuadre importante**: para "pendiente" (leg imbalance), la posición
+individual YA se auto-resolvía sola desde antes (`real_resolution_job` corre
+independiente del kill-switch, sólo bloquea trading *nuevo*) -- Al Ittihad y
+Boca Juniors resolvieron solos sin backfill manual. Lo que realmente estaba
+en discusión no era "¿el sistema puede resolver la posición solo?" sino
+**"¿puede el FLAG GLOBAL del kill-switch levantarse solo una vez que el
+incidente puntual quedó cerrado y verificado?"** -- una pregunta más acotada.
+
+**Implementación** (`execution/real_resolution_job.py::attempt_auto_recovery_of_unconfirmed_positions`,
+integrada al job periódico existente -- NO un bloqueo sincrónico nuevo en
+`_execute_fill`):
+
+1. **Gate por huella exacta** (`_matches_known_signature`): sólo
+   `status="delayed"`, `success=true`, sin `errorMsg` -- exactamente la
+   combinación ya vista 3/3 veces. **Cualquier desviación cae al
+   comportamiento manual, sin ningún intento de generalizar** (pedido
+   explícito del usuario, documentado también en el docstring del módulo).
+2. **Revisión larga, no los 6s de `_confirmed_fill`**: espera
+   `REAL_UNCONFIRMED_AUTO_RECOVERY_DELAY_SECONDS` (default 300s/5min) desde
+   el intento original antes de volver a consultar `get_trades` una vez
+   más -- esa ventana corta fue justamente la causa del incidente de
+   Kashiwa Reysol. Si en esa consulta aparece un trade tardío (contradiciendo
+   los 3 casos reales, donde nunca apareció ninguno), se deja para revisión
+   manual con la info nueva -- fuera del alcance aprobado, no se intenta
+   continuar el flujo de ejecución original.
+3. **Backfill con la MISMA fórmula ya usada**, no una nueva: reusa
+   `_close_real_position` (`winning_shares - cost_usd`). Cuando la pata sin
+   confirmar es YES, NO nunca se llegó a enviar -- toda la posición queda en
+   cero capital real. Cuando es NO (caso AS Monaco), YES ya tenía su costo
+   real confirmado de antes; se usa tal cual.
+4. **El flag global se levanta solo únicamente si, tras cerrar esta
+   posición, no queda NINGÚN otro incidente abierto** (`_no_other_open_incidents`,
+   cuenta `"pendiente"` + `"sin_confirmar"`) -- respeta automáticamente que
+   un leg imbalance por red nunca se auto-recupera: mientras esa posición
+   siga genuinamente `"pendiente"` (mercado sin resolver), el flag no se
+   levanta por más que ESTE incidente puntual ya haya quedado resuelto.
+5. **Tope de auto-recuperaciones en ventana móvil** (`REAL_AUTO_RECOVERY_MAX_PER_WINDOW`=3
+   en `REAL_AUTO_RECOVERY_WINDOW_HOURS`=72h, contra eventos persistidos, no
+   "desde el último restart" -- un restart no equivale a revisión humana):
+   si se alcanza, la posición **sí** se verifica y backfillea igual (ya se
+   hizo el trabajo de confirmarla con certeza), pero el kill-switch **no**
+   se levanta solo -- el evento `auto_recovery_capped` deja explícito que es
+   por el tope alcanzado, no porque el caso puntual sea distinto (pedido
+   explícito del usuario para no generar confusión).
+6. **Logging con severidad CRITICAL** (no "info", para que no se pierda
+   entre el ruido normal), `event_type` propio (`auto_recovered_unconfirmed_fill`,
+   `auto_recovery_capped`, `kill_switch_auto_cleared`), con `detail` completo
+   (huella cruda, pata, tiempo transcurrido, P&L real) -- visibilidad total
+   sin necesitar aprobación en el momento.
+
+**Reconciliación extendida en paralelo**: `_has_pending_position` ahora
+también cuenta `"sin_confirmar"` (misma asimetría -- sólo divergencia
+POSITIVA recibe el margen, nunca negativa) -- una posición como AS Monaco
+también puede generar un excedente positivo benigno mientras se verifica.
+
+**Tests**: `test_auto_recovers_yes_leg_and_clears_kill_switch_when_no_other_incidents`,
+`test_auto_recovers_no_leg_pays_using_already_confirmed_yes_cost`,
+`test_signature_mismatch_leaves_position_untouched_for_manual_review`,
+`test_not_enough_elapsed_time_skips_this_cycle`,
+`test_market_not_resolved_yet_leaves_position_sin_confirmar`,
+`test_late_trade_found_contradicts_signature_left_for_manual_review`,
+`test_no_fill_not_confirmed_event_leaves_position_untouched`,
+`test_cap_reached_backfills_position_but_does_not_clear_kill_switch`,
+`test_does_not_clear_kill_switch_when_other_incident_still_open`,
+`test_capped_event_is_not_logged_twice_across_cycles` (en
+`test_execution_real_resolution_job.py`); `test_positive_divergence_with_sin_confirmar_position_self_heals_within_grace_window`,
+`test_negative_divergence_with_sin_confirmar_position_halts_immediately`
+(en `test_execution_reconciliation.py`); `test_clear_removes_the_flag`,
+`test_clear_is_a_noop_when_no_flag` (en `test_execution_kill_switch.py`).
+
+**Variables nuevas en `.env`**: `REAL_UNCONFIRMED_AUTO_RECOVERY_DELAY_SECONDS`
+(300.0), `REAL_AUTO_RECOVERY_MAX_PER_WINDOW` (3), `REAL_AUTO_RECOVERY_WINDOW_HOURS` (72.0).
+
+**No implementado a propósito, descartado en la discusión**: bloqueo por
+mercado específico en vez de global -- el beneficio real es chico (cada
+incidente histórico fue un mercado distinto que de todos modos no iba a
+repetirse en la ventana del mismo partido) contra el costo de construir una
+lista de exclusión nueva, sin precedente, con más superficie para un bug
+tipo "mercado bloqueado para siempre sin que nadie se dé cuenta".
+
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
@@ -1628,17 +1749,16 @@ la incertidumbre sobre si es fijo o varía por mercado).
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
   explícita del usuario, con el mismo nivel de escrutinio que las veces
   anteriores. Esta sería la undécima activación.
-- Seguir contando la frecuencia de `fill_not_confirmed` a través de las
-  activaciones (van 2 casos: AS Monaco FC y Manchester United, en 2
-  activaciones consecutivas) -- si aparece un 3er caso, evaluar si hay algo
-  sistemático más allá del riesgo residual ya aceptado (pedido explícito del
-  usuario).
 - Si en el futuro se confirma con certeza la unidad real de `min_order_size`
   contra un caso real (ej. un rechazo similar donde el book todavía exista
   para consultarlo), revisar si `REAL_MIN_ORDER_VALUE_USD` debería leerse
   dinámicamente del propio `min_order_size` del book en vez de ser una
   constante fija -- ver la incertidumbre documentada en la sección "Décima
   activación" arriba.
+- Verificar en producción que la auto-recuperación de `sin_confirmar`
+  funciona como se diseñó la próxima vez que aparezca un caso con la huella
+  conocida -- hasta ahora sólo está probada con tests, no contra un
+  incidente real.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
