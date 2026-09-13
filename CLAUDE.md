@@ -1504,12 +1504,43 @@ anotado como gap separado por si se quiere cerrar más adelante. Cubierto en
 (extendido) y `test_unconfirmed_yes_fill_persists_raw_response_in_detail`
 (nuevo, cobertura de la pata YES que no existía antes).
 
-**Paso 2 -- pendiente, condicionado a capturar un caso real**: una vez que
-`detail.raw_response` capture un caso real de "no matcheó", confirmar ahí
-mismo si trae una señal inequívoca (`errorMsg`/`status`) y recién entonces
-agregar una vía rápida que la reconozca y salte directo a
-`_handle_leg_imbalance` sin gastar los reintentos. No implementar con el
-string inferido de documentación externa sin verificarlo primero.
+**Paso 2 -- descartado (no pospuesto) el 2026-09-13, con evidencia real en
+contra**: la 9na activación capturó el primer caso real de `fill_not_confirmed`
+con el Paso 1 ya desplegado -- posición 14, *"Will Manchester United FC win
+on 2026-09-13?"* (pata YES, 15:52:49 GMT). La respuesta cruda de
+`create_and_post_market_order`, persistida en `detail.raw_response`:
+
+```json
+{"errorMsg": "", "orderID": "0xd55d8182...", "takingAmount": "", "makingAmount": "", "status": "delayed", "success": true}
+```
+
+`status="delayed"` es uno de los 4 valores documentados públicamente por
+Polymarket (`live`/`matched`/`delayed`/`unmatched`), y su significado
+documentado es *"la orden es marketable pero sujeta a un delay de
+matching"* -- es decir, sugiere "esperá, va a matchear", no lo contrario.
+**Se investigó el resultado real (mismo método que AS Monaco FC): `get_trades`
+para ese token, consultado varios minutos después, devolvió 0 trades en
+total; `data-api.polymarket.com/activity` on-chain confirmó 0 trades, ningún
+capital se movió; `get_order(order_id)` devolvió `None`.** La orden **nunca
+matcheó**, a pesar de que la respuesta inmediata decía `status="delayed"`
+con `success=true` -- la señal documentada no predijo el resultado final.
+
+**Conclusión, para que futuras sesiones no vuelvan a proponer esto sin la
+misma evidencia en contra**: no existe (al menos no `status`, el candidato
+más obvio y documentado) una señal confiable en la respuesta INMEDIATA de
+`create_and_post_market_order` que permita distinguir con certeza "esto va a
+matchear en breve" de "esto nunca va a matchear" -- ambos casos pueden
+devolver la misma respuesta (`status="delayed"`, `success=true`, sin
+`errorMsg`). Construir un atajo que saltara los reintentos basado en este
+campo habría llevado a la conclusión equivocada en este caso real
+específico. El diseño actual (reintentar con `get_trades` hasta agotar
+`REAL_FILL_CONFIRM_RETRIES`, y si sigue sin certeza, no asumir nada -- ni que
+calzó, ni que no) sigue siendo el correcto dado lo que se sabe hoy. Si en el
+futuro se quiere retomar esta idea, hace falta evidencia nueva y distinta a
+la ya descartada acá (por ejemplo, un caso real donde la respuesta inmediata
+sí distinga de forma consistente los dos desenlaces) -- no alcanza con
+volver a leer la documentación pública de `status`, ya se comprobó que no
+alcanza.
 
 ### Pendiente para la próxima activación
 
@@ -1517,11 +1548,12 @@ string inferido de documentación externa sin verificarlo primero.
   puntos de la primera vez) antes de volver a pedir luz verde -- no se activa
   `REAL_TRADING_ENABLED` de nuevo sin ese chequeo ni sin confirmación
   explícita del usuario, con el mismo nivel de escrutinio que las veces
-  anteriores. Esta sería la novena activación.
-- Paso 2 de la investigación de FOK sin match (ver sección "Octava
-  activación" arriba): esperar a que `detail.raw_response` capture un caso
-  real de "no matcheó" antes de implementar cualquier atajo que salte los
-  reintentos de `_confirmed_fill`.
+  anteriores. Esta sería la décima activación.
+- Backfill pendiente de la posición 14 (ver sección "Octava activación"
+  arriba, el ejemplo real que descartó el Paso 2): el partido *"Will
+  Manchester United FC win on 2026-09-13?"* seguía en curso al momento de
+  escribir esto -- corregir `status`/`realized_pnl` con el resultado real
+  (mismo patrón que AS Monaco FC/Kashiwa Reysol) apenas el mercado resuelva.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
