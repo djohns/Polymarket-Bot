@@ -261,19 +261,25 @@ def _build_real_execution_engine() -> RealExecutionEngine | None:
     (Fase 3). Devuelve None si `REAL_TRADING_ENABLED` no está en true -- el
     resto del sistema sigue funcionando en modo Fase 1/2 sin cambios.
 
+    **Se construye SIEMPRE que `REAL_TRADING_ENABLED=true`, sin importar
+    `kill_switch.is_halted()`** (fix del 2026-09-14 -- ver CLAUDE.md, sección
+    Fase 3, "auto-recuperación de sin_confirmar"): antes, si el kill-switch ya
+    estaba activo al arrancar, esta función devolvía `None` de plano, dejando
+    `resolution_loop` sin cliente para `get_trades`/`get_market` -- exactamente
+    el escenario en el que la auto-recuperación necesita correr (mientras el
+    halt sigue activo). Este chequeo era redundante para la seguridad real:
+    `RealExecutionEngine.maybe_execute` ya verifica `is_halted()` de forma
+    independiente antes de cada intento de orden, así que ninguna orden real
+    se envía mientras el flag exista, tenga el motor cliente construido o no
+    -- la separación es intencional (que exista el cliente no implica que se
+    pueda operar), no una regresión de seguridad.
+
     La private key sólo existe en memoria de este proceso a partir de acá
     (ver `execution.key_management`); nunca se loguea ni se vuelve a escribir
     a disco.
     """
     if not settings.real_trading_enabled:
         logger.info("REAL_TRADING_ENABLED=false -- Fase 3 desactivada, sólo paper trading")
-        return None
-
-    if kill_switch.is_halted():
-        logger.critical(
-            "Kill-switch ya está activo al arrancar (%s) -- no se construye el motor de ejecución real",
-            settings.real_kill_switch_flag_path,
-        )
         return None
 
     if not settings.real_funder_address:
@@ -320,12 +326,20 @@ def _build_real_execution_engine() -> RealExecutionEngine | None:
         logger.critical("Allowance de COLLATERAL no operable -- Fase 3 no arranca")
         return None
 
-    logger.warning(
-        "FASE 3 ACTIVA: ejecución real habilitada (capital base $%.2f, tope $%.2f/mercado, $%.2f/cluster)",
-        settings.real_capital_base_usd,
-        settings.real_max_exposure_per_market_usd,
-        settings.real_max_exposure_per_cluster_usd,
-    )
+    if kill_switch.is_halted():
+        logger.warning(
+            "FASE 3: motor y cliente CLOB construidos, pero el kill-switch (%s) ya está "
+            "activo -- maybe_execute() seguirá rechazando cualquier orden real hasta que "
+            "se levante (manual o vía auto-recuperación)",
+            settings.real_kill_switch_flag_path,
+        )
+    else:
+        logger.warning(
+            "FASE 3 ACTIVA: ejecución real habilitada (capital base $%.2f, tope $%.2f/mercado, $%.2f/cluster)",
+            settings.real_capital_base_usd,
+            settings.real_max_exposure_per_market_usd,
+            settings.real_max_exposure_per_cluster_usd,
+        )
     return RealExecutionEngine(client, get_session)
 
 
