@@ -149,6 +149,30 @@ class Settings:
     # que varía por mercado como `min_order_size`. Ver CLAUDE.md, sección
     # Fase 3, "Prevención de leg imbalance por presupuesto infeasible".
     real_min_order_value_usd: float = _float_env("REAL_MIN_ORDER_VALUE_USD", 1.0)
+    # Auto-recuperación de "sin_confirmar" (2026-09-14, ver CLAUDE.md sección
+    # Fase 3 y execution/real_resolution_job.py) -- 3 casos ya con la MISMA
+    # huella exacta (status="delayed", success=true, sin errorMsg, 0 trades
+    # reales confirmados incluso horas después) justifican automatizar el
+    # proceso de verificación manual ya probado, no un atajo nuevo. Tiempo
+    # mínimo desde el intento original antes de dar por buena la ausencia de
+    # trade -- deliberadamente mucho más largo que los ~6s de reintentos de
+    # `_confirmed_fill` (esa ventana corta fue justamente la causa del
+    # incidente de Kashiwa Reysol, que sí encontró el trade real minutos
+    # después). 5 minutos da margen amplio sobre cualquier lag de indexación
+    # ya observado.
+    real_unconfirmed_auto_recovery_delay_seconds: float = _float_env(
+        "REAL_UNCONFIRMED_AUTO_RECOVERY_DELAY_SECONDS", 300.0
+    )
+    # Tope de auto-recuperaciones en una ventana móvil -- si se alcanza, la
+    # siguiente auto-recuperación posible NO levanta el kill-switch (aunque
+    # la posición puntual sí se verifique y se backfillee con su resultado
+    # real) -- fuerza revisión humana igual, para detectar si el patrón
+    # "conocido" empezó a comportarse distinto de lo esperado. Ventana móvil
+    # sobre eventos persistidos, no "desde el último restart" -- un restart
+    # del proceso no debe resetear la cuenta, ya que no equivale a que un
+    # humano haya revisado nada.
+    real_auto_recovery_max_per_window: int = _int_env("REAL_AUTO_RECOVERY_MAX_PER_WINDOW", 3)
+    real_auto_recovery_window_hours: float = _float_env("REAL_AUTO_RECOVERY_WINDOW_HOURS", 72.0)
 
 
 settings = Settings()

@@ -12,7 +12,8 @@ que alguien audite a mano para notarlo.
 
 Tolerancia asimétrica agregada el 2026-09-12 (ver
 `check_balance_reconciliation_with_grace`): una divergencia POSITIVA (sobra
-plata) con una posición "pendiente" en curso puede ser sólo el lag benigno
+plata) con una posición "pendiente" o "sin_confirmar" en curso (extendido el
+2026-09-14, ver `_has_pending_position`) puede ser sólo el lag benigno
 entre una resolución on-chain y que `real_resolution_job` la marque
 "cerrada" (confirmado 2 veces: Santa Fe, Al Ittihad) -- se le da un margen
 corto antes de decidir. Una divergencia NEGATIVA (falta plata) NUNCA recibe
@@ -79,13 +80,20 @@ def expected_balance_usd(session: Session) -> float:
 
 
 def _has_pending_position(session: Session) -> bool:
-    """Una posición "pendiente" es candidata a estar resolviendo justo ahora
-    (shares reales confirmadas, ya redimida on-chain, sólo falta que
-    `real_resolution_job` la marque "cerrada") -- ver CLAUDE.md, casos Santa
-    Fe/HJK/Al Ittihad. Es la condición que hace plausible que una divergencia
-    POSITIVA sea ese lag benigno y no un bug nuevo."""
+    """Una posición "pendiente" o "sin_confirmar" es candidata a estar
+    resolviendo/verificándose justo ahora -- "pendiente" (shares reales
+    confirmadas, ya redimida on-chain, sólo falta que `real_resolution_job`
+    la marque "cerrada", ver CLAUDE.md, casos Santa Fe/HJK/Al Ittihad) o
+    "sin_confirmar" (2026-09-14: con la auto-recuperación de
+    `real_resolution_job::attempt_auto_recovery_of_unconfirmed_positions`,
+    una posición como AS Monaco -- capital real en una pata, la otra sin
+    confirmar -- también puede generar un excedente positivo benigno mientras
+    se verifica y se cierra sola). Es la condición que hace plausible que una
+    divergencia POSITIVA sea ese lag benigno y no un bug nuevo."""
     count = session.execute(
-        select(func.count()).select_from(RealPosition).where(RealPosition.status == "pendiente")
+        select(func.count())
+        .select_from(RealPosition)
+        .where(RealPosition.status.in_(("pendiente", "sin_confirmar")))
     ).scalar_one()
     return count > 0
 

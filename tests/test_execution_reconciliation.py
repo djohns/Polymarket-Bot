@@ -188,6 +188,97 @@ def _pending_position(**overrides) -> RealPosition:
     return RealPosition(**defaults)
 
 
+def _sin_confirmar_position(**overrides) -> RealPosition:
+    defaults = {
+        "market_id": "0xunconfirmed", "cluster_id": "c1", "question": "q", "status": "sin_confirmar",
+        "yes_shares": 0, "no_shares": 0, "yes_price_avg": 0.0, "no_price_avg": 0.0, "cost_usd": 0.0,
+        "fee_paid": 0.0, "net_pnl_expected": 0.0,
+    }
+    defaults.update(overrides)
+    return RealPosition(**defaults)
+
+
+def test_positive_divergence_with_sin_confirmar_position_self_heals_within_grace_window(tmp_path):
+    """Extensión del 2026-09-14: "sin_confirmar" recibe la misma tolerancia
+    positiva que "pendiente" -- una posición como AS Monaco FC (capital real
+    en una pata, la otra sin confirmar) también puede generar un excedente
+    positivo benigno mientras la auto-recuperación la verifica y cierra."""
+    session_factory = _session_factory()
+    flag = tmp_path / "HALT"
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_reconciliation_grace_period_seconds=240.0,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
+        with session_factory() as session:
+            pos = _sin_confirmar_position()
+            session.add(pos)
+            session.commit()
+
+            sleep_calls: list[float] = []
+
+            async def fake_sleep(seconds: float) -> None:
+                sleep_calls.append(seconds)
+                pos.status = "cerrada"
+                pos.realized_pnl = 0.0
+                session.commit()
+
+            async def recheck_balance() -> float:
+                return 20.0  # el balance no cambia -- "sin_confirmar" nunca gastó capital real
+
+            # expected antes: 20 - 0 (comprometido, cost_usd=0 para sin_confirmar) = 20;
+            # actual=20.6 -> diff=+0.6, supera el umbral de 0.50 -> dispara la gracia.
+            triggered = asyncio.run(
+                reconciliation.check_balance_reconciliation_with_grace(
+                    session, 20.6, recheck_balance=recheck_balance, sleep=fake_sleep
+                )
+            )
+        assert triggered is False
+        assert not flag.exists()
+        assert sleep_calls == [240.0]
+
+
+def test_negative_divergence_with_sin_confirmar_position_halts_immediately(tmp_path):
+    """CRÍTICO (pedido explícito del usuario): la asimetría sigue aplicando
+    para "sin_confirmar" -- una divergencia NEGATIVA nunca recibe el margen
+    de espera, sin importar si hay una posición "sin_confirmar" en curso.
+    Podría ser una pérdida real o un bug nuevo, mismo criterio que "pendiente"."""
+    session_factory = _session_factory()
+    flag = tmp_path / "HALT"
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_reconciliation_grace_period_seconds=240.0,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
+        with session_factory() as session:
+            session.add(_sin_confirmar_position())
+            session.commit()
+
+            sleep_calls: list[float] = []
+
+            async def fake_sleep(seconds: float) -> None:
+                sleep_calls.append(seconds)
+
+            async def recheck_balance() -> float:
+                raise AssertionError("no debería recheckear una divergencia negativa")
+
+            # expected = 20 - 0 = 20; actual=19 -> diff=-1, negativa
+            triggered = asyncio.run(
+                reconciliation.check_balance_reconciliation_with_grace(
+                    session, 19.0, recheck_balance=recheck_balance, sleep=fake_sleep
+                )
+            )
+        assert triggered is True
+        assert kill_switch.is_halted(str(flag)) is True
+        assert sleep_calls == []  # nunca esperó
+
+
 def test_positive_divergence_with_pending_position_self_heals_within_grace_window(tmp_path):
     """Escenario Santa Fe/Al Ittihad: la posición "pendiente" resuelve y el job
     la cierra durante la ventana de gracia -- para el re-chequeo, la

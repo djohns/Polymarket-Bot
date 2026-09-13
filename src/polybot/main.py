@@ -14,7 +14,10 @@ from polybot.execution import kill_switch, reconciliation
 from polybot.execution.allowances import ensure_collateral_allowance
 from polybot.execution.key_management import load_private_key
 from polybot.execution.real_executor import RealExecutionEngine
-from polybot.execution.real_resolution_job import resolve_open_real_positions
+from polybot.execution.real_resolution_job import (
+    attempt_auto_recovery_of_unconfirmed_positions,
+    resolve_open_real_positions,
+)
 from polybot.execution.resolution_job import resolve_open_positions
 from polybot.execution.simulator import simulate_arbitrage_fill
 from polybot.ingestion.gamma_discovery import MarketInfo, fetch_active_markets
@@ -215,7 +218,7 @@ async def _run_ws_session(
     return asyncio.create_task(ws_client.run())
 
 
-async def resolution_loop() -> None:
+async def resolution_loop(real_client=None) -> None:
     """Job periódico e independiente del loop de ingesta/detección (Fase 2, parte 2):
     consulta la resolución real de los mercados con posiciones de arb abiertas o
     pendientes, cierra las que ya resolvieron con su P&L realizado, y aprovecha esa
@@ -229,6 +232,15 @@ async def resolution_loop() -> None:
     quedaba `"abierta"` para siempre, y la reconciliación automática disparaba
     el kill-switch comparando contra ese estado ya desactualizado). Mismo ciclo,
     misma sesión -- no hace falta un loop aparte.
+
+    `real_client` (2026-09-14, ver `execution.real_resolution_job`): si no es
+    `None` (Fase 3 activa), este mismo ciclo también intenta auto-recuperar
+    posiciones `"sin_confirmar"` con la huella ya caracterizada -- necesita el
+    cliente CLOB autenticado para `get_trades`/`get_market`, que las llamadas
+    de sólo lectura de este loop no usaban hasta ahora. La llamada síncrona
+    del SDK se ejecuta en un executor aparte (`asyncio.to_thread`, dentro de
+    `attempt_auto_recovery_of_unconfirmed_positions`), igual que en
+    `real_balance_kill_switch_loop`.
     """
     stale_after = dt.timedelta(days=settings.resolution_stale_after_days)
     warned_stale: set[int] = set()
@@ -237,6 +249,8 @@ async def resolution_loop() -> None:
             with get_session() as session:
                 await resolve_open_positions(session, stale_after=stale_after, warned_stale=warned_stale)
                 await resolve_open_real_positions(session)
+                if real_client is not None:
+                    await attempt_auto_recovery_of_unconfirmed_positions(session, real_client)
         except Exception:
             logger.exception("Fallo en el ciclo de resolución de mercados, se reintenta en el próximo ciclo")
         await asyncio.sleep(settings.resolution_check_interval_seconds)
@@ -362,7 +376,7 @@ async def run() -> None:
     logger.info("Arrancando ingesta, arb_threshold=%.3f", settings.arb_threshold)
     current_ids = {m.condition_id for m in markets}
     ws_task = await _run_ws_session(markets, store, real_engine)
-    asyncio.create_task(resolution_loop())
+    asyncio.create_task(resolution_loop(real_engine._client if real_engine is not None else None))
 
     while True:
         await asyncio.sleep(settings.discovery_interval_seconds)

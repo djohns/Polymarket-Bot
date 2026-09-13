@@ -31,6 +31,23 @@ def test_halt_is_idempotent_does_not_overwrite(tmp_path):
     assert flag.read_text() == original
 
 
+def test_clear_removes_the_flag(tmp_path):
+    flag = tmp_path / "HALT"
+    kill_switch.halt("motivo de prueba", str(flag))
+    assert flag.exists()
+
+    kill_switch.clear(str(flag))
+
+    assert not flag.exists()
+    assert kill_switch.is_halted(str(flag)) is False
+
+
+def test_clear_is_a_noop_when_no_flag(tmp_path):
+    flag = tmp_path / "HALT"
+    kill_switch.clear(str(flag))  # no debe lanzar aunque el archivo nunca existió
+    assert not flag.exists()
+
+
 def test_check_balance_kill_switch_triggers_below_floor(tmp_path):
     """Sin ninguna posición real en curso, equity == balance líquido -- una
     pérdida real genuina (equity bajo el piso) sí debe disparar el kill-switch."""

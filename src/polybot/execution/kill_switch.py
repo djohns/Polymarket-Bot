@@ -55,6 +55,20 @@ def is_halted(flag_path: str | None = None) -> bool:
     return os.path.exists(flag_path or settings.real_kill_switch_flag_path)
 
 
+def clear(flag_path: str | None = None) -> None:
+    """Levanta el kill-switch borrando el flag -- uso exclusivo de mecanismos de
+    auto-recuperación ya aprobados explícitamente y con sus propias
+    salvaguardas (ver `execution.real_resolution_job`, 2026-09-14: huella de
+    respuesta exacta ya caracterizada + tope de auto-recuperaciones por
+    ventana móvil). Nunca se llama desde un flujo manual -- borrar el archivo
+    a mano en la VPS sigue siendo el camino humano de siempre para cualquier
+    otra causa de parada."""
+    path = flag_path or settings.real_kill_switch_flag_path
+    if os.path.exists(path):
+        os.remove(path)
+        logger.warning("Kill-switch levantado automáticamente (flag: %s)", path)
+
+
 def halt(reason: str, flag_path: str | None = None, session: Session | None = None) -> None:
     """Escribe el flag de parada si todavía no existe (idempotente -- no pisa el
     motivo/timestamp de una parada previa si ya estaba activa). Si se pasa
