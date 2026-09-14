@@ -464,6 +464,38 @@ tests/
 - **Variable nueva en `.env`**: `DASHBOARD_OUTPUT_PATH` (default
   `data/dashboard.html`).
 
+### Panel de estado de Fase 3 en el dashboard (2026-09-14)
+
+Pedido explícito: que con un vistazo al dashboard (sin acceder a la VPS) se
+sepa si el trading real necesita atención. Se agregó un panel prominente,
+arriba del todo, separado del resto de las métricas de paper trading.
+
+- **Clasificación en 3 estados** (`dashboard/snapshot.py::RealTradingStatus`/
+  `_build_real_trading_status`): `"activo"` (sin halt), `"manual"` (halt que
+  requiere luz verde explícita — drawdown, leg imbalance de red,
+  `leg_size_mismatch`, reconciliación, o un `sin_confirmar` que ya agotó su
+  tope de auto-recuperaciones), `"auto_recuperando"` (halt por un
+  `sin_confirmar` que todavía puede resolverse solo, ver
+  `real_resolution_job.py`). La distinción "auto_recuperando" vs. "manual"
+  para un halt por "fill sin confirmar" depende de si existe un evento
+  `auto_recovery_capped` para esa posición — si existe, degrada a manual
+  aunque el mensaje original siga mencionando "sin confirmar", para no
+  mostrar una falsa señal de "esto se resuelve solo" después de que el tope
+  ya se agotó.
+- **El motivo de un halt se lee tal cual del flag** (`_read_kill_switch_flag`,
+  parseando el mismo formato `f"{iso_timestamp} -- {reason}"` que
+  `kill_switch.halt()` ya escribe) — nunca se redacta una descripción nueva,
+  por instrucción explícita del usuario. Un flag con formato inesperado (ej.
+  escrito a mano) no rompe el dashboard: se degrada a "manual" sin motivo,
+  mostrando un placeholder visible en vez de fallar.
+- **Duración del halt**: se calcula contra `Snapshot.generated_at` (el
+  momento en que se generó el reporte), no `datetime.now()` — el dashboard es
+  HTML estático, mostrar la hora de generación en vez de "ahora" evita que el
+  cálculo quede mal apenas alguien abre un archivo viejo.
+- **Sin dependencias nuevas**: reusa exactamente los mismos datos que Fase 3
+  ya persistía (el flag file, `RealPosition.status`, `RealExecutionEvent`) —
+  es un cambio de visualización puro, no toca ninguna lógica de trading.
+
 ## Fase 2, parte 4 — dashboard vía web (nginx)
 
 Detalle completo de instalación en [docs/deploy.md](docs/deploy.md); resumen

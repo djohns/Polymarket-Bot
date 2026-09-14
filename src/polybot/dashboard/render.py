@@ -10,9 +10,15 @@ from __future__ import annotations
 import datetime as dt
 import html
 
-from polybot.dashboard.snapshot import Snapshot
+from polybot.dashboard.snapshot import RealTradingStatus, Snapshot
 
 _STATUS_LABELS = {"abierta": "Abiertas", "cerrada": "Cerradas / resueltas", "pendiente": "Pendientes"}
+
+_REAL_TRADING_STATE_LABELS = {
+    "activo": "Activo y operable",
+    "manual": "Detenido — esperando aprobación manual",
+    "auto_recuperando": "Detenido — auto-recuperándose solo",
+}
 
 
 def _fmt_money(x: float | None) -> str:
@@ -106,6 +112,47 @@ def _svg_bar_chart(labels_values: list[tuple[str, float | None, int]], *, width:
 """
 
 
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, _ = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _real_trading_panel(status: RealTradingStatus, generated_at: dt.datetime) -> str:
+    """Panel prominente y separado del resto del dashboard (Fase 2, paper
+    trading) -- pedido explícito: que con un vistazo, sin entrar a la VPS, se
+    sepa si Fase 3 necesita atención. El motivo de un halt es tal cual el que
+    ya persiste `kill_switch.halt()` -- nunca se redacta uno nuevo acá."""
+    state_class = {"activo": "rt-activo", "manual": "rt-manual", "auto_recuperando": "rt-auto"}[status.state]
+    label = _REAL_TRADING_STATE_LABELS[status.state]
+
+    rows = [
+        f'<div class="rt-row"><span class="rt-key">REAL_TRADING_ENABLED</span><span>{"Sí" if status.enabled else "No"}</span></div>'
+    ]
+
+    if status.halted:
+        reason = status.halt_reason or "motivo no disponible (el flag no tiene el formato esperado)"
+        rows.append(f'<div class="rt-row"><span class="rt-key">Motivo</span><span>{_esc(reason)}</span></div>')
+        if status.halted_since is not None:
+            elapsed = (generated_at - status.halted_since).total_seconds()
+            rows.append(
+                f'<div class="rt-row"><span class="rt-key">Detenido desde</span>'
+                f"<span>{_esc(_fmt_dt(status.halted_since))} (hace {_fmt_duration(elapsed)})</span></div>"
+            )
+    else:
+        rows.append('<div class="rt-row"><span class="rt-key">Kill-switch</span><span>Sin activar</span></div>')
+
+    return f"""
+<div class="real-trading-panel {state_class}">
+  <div class="rt-header"><span class="rt-dot"></span><strong>Fase 3 (trading real): {_esc(label)}</strong></div>
+  {''.join(rows)}
+</div>
+"""
+
+
 def _positions_table(positions: list[dict]) -> str:
     if not positions:
         return '<p class="empty">Sin posiciones simuladas todavía.</p>'
@@ -189,6 +236,8 @@ def render_html(snap: Snapshot) -> str:
     --info-soft: #e5eefa;
     --warn: #a8690a;
     --warn-soft: #faeed9;
+    --danger: #b1332b;
+    --danger-soft: #fbe6e4;
   }}
   @media (prefers-color-scheme: dark) {{
     :root:not([data-theme="light"]) {{
@@ -204,6 +253,8 @@ def render_html(snap: Snapshot) -> str:
       --info-soft: #172a3d;
       --warn: #e0a53f;
       --warn-soft: #34280f;
+      --danger: #e2665d;
+      --danger-soft: #351a17;
     }}
   }}
   :root[data-theme="dark"] {{
@@ -219,6 +270,8 @@ def render_html(snap: Snapshot) -> str:
     --info-soft: #172a3d;
     --warn: #e0a53f;
     --warn-soft: #34280f;
+    --danger: #e2665d;
+    --danger-soft: #351a17;
   }}
   * {{ box-sizing: border-box; }}
   body {{
@@ -269,11 +322,32 @@ def render_html(snap: Snapshot) -> str:
   .note code {{ font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 11.5px; }}
   .cols {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
   @media (max-width: 760px) {{ .cols {{ grid-template-columns: 1fr; }} body {{ padding: 24px 18px 40px; }} }}
+
+  .real-trading-panel {{
+    border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px;
+    margin-bottom: 28px; background: var(--surface);
+  }}
+  .rt-header {{ display: flex; align-items: center; gap: 9px; font-size: 15px; margin-bottom: 8px; }}
+  .rt-dot {{ width: 10px; height: 10px; border-radius: 50%; flex: none; }}
+  .rt-row {{
+    display: flex; justify-content: space-between; gap: 16px; font-size: 13px;
+    padding: 3px 0; color: var(--text-secondary);
+  }}
+  .rt-row .rt-key {{ color: var(--text-muted); }}
+  .rt-row span:last-child {{ text-align: right; color: var(--text-primary); }}
+  .real-trading-panel.rt-activo {{ border-color: var(--accent); background: var(--accent-soft); }}
+  .real-trading-panel.rt-activo .rt-dot {{ background: var(--accent); }}
+  .real-trading-panel.rt-manual {{ border-color: var(--danger); background: var(--danger-soft); }}
+  .real-trading-panel.rt-manual .rt-dot {{ background: var(--danger); }}
+  .real-trading-panel.rt-auto {{ border-color: var(--info); background: var(--info-soft); }}
+  .real-trading-panel.rt-auto .rt-dot {{ background: var(--info); }}
 </style>
 </head>
 <body>
   <h1>Polymarket Bot — ledger de arbitraje</h1>
   <div class="subtitle">Fase 2 (paper trading) · generado {_esc(_fmt_dt(snap.generated_at))} · sin trading real, todo simulado</div>
+
+  {_real_trading_panel(snap.real_trading, snap.generated_at)}
 
   <h2>Posiciones simuladas ({total_positions} en total)</h2>
   <div class="grid">{status_cards}</div>
