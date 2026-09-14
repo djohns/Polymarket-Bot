@@ -132,3 +132,63 @@ def test_malformed_flag_reason_falls_back_to_a_visible_placeholder():
     html = render_html(snap)
 
     assert "motivo no disponible" in html
+
+
+# ============================================================================
+# Bloqueo per-mercado de sin_confirmar (2026-09-14) -- ver CLAUDE.md.
+# ============================================================================
+
+
+def test_locked_markets_shown_even_when_state_is_activo():
+    """El bloqueo per-mercado (2026-09-14) puede dejar 1+ mercados bloqueados
+    sin que haya ningún halt GLOBAL -- state sigue "activo" (kill-switch sin
+    activar), pero el panel igual debe mostrar los mercados bloqueados, no
+    ocultarlos detrás del estado global."""
+    snap = _empty_snapshot()
+    snap.real_trading = RealTradingStatus(
+        enabled=True,
+        halted=False,
+        halt_reason=None,
+        halted_since=None,
+        state="activo",
+        locked_markets=[("0xabc", "¿Gana el local?")],
+    )
+
+    html = render_html(snap)
+
+    assert 'class="real-trading-panel rt-activo"' in html
+    assert "Mercados bloqueados (sin_confirmar)" in html
+    assert "¿Gana el local?" in html
+    assert ">1:" in html or "1: " in html
+
+
+def test_no_locked_markets_row_when_none_are_blocked():
+    html = render_html(_empty_snapshot())
+    assert "Mercados bloqueados" not in html
+
+
+def test_many_locked_markets_shows_count_and_truncates_detail():
+    """Con más de 3 mercados bloqueados, el detalle no lista todos -- sólo los
+    primeros 3 más un contador, para no saturar el panel (pedido explícito)."""
+    snap = _empty_snapshot()
+    snap.real_trading = RealTradingStatus(
+        enabled=True,
+        halted=False,
+        halt_reason=None,
+        halted_since=None,
+        state="activo",
+        locked_markets=[
+            ("0x1", "¿Gana A?"),
+            ("0x2", "¿Gana B?"),
+            ("0x3", "¿Gana C?"),
+            ("0x4", "¿Gana D?"),
+            ("0x5", "¿Gana E?"),
+        ],
+    )
+
+    html = render_html(snap)
+
+    assert "5:" in html
+    assert "¿Gana A?" in html
+    assert "¿Gana D?" not in html
+    assert "+2 más" in html

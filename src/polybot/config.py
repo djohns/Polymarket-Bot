@@ -174,5 +174,39 @@ class Settings:
     real_auto_recovery_max_per_window: int = _int_env("REAL_AUTO_RECOVERY_MAX_PER_WINDOW", 3)
     real_auto_recovery_window_hours: float = _float_env("REAL_AUTO_RECOVERY_WINDOW_HOURS", 72.0)
 
+    # Bloqueo per-mercado de "sin_confirmar" (2026-09-14, ver CLAUDE.md sección
+    # Fase 3 -- auditoría del 63/66 señales elegibles perdidas por downtime en
+    # 48h): un `sin_confirmar` ya no detiene TODO el sistema, sólo el mercado
+    # puntual (mientras su fila siga en ese status, `maybe_execute` lo omite
+    # -- ver `real_executor._market_locked_by_unconfirmed`). Pero varios
+    # mercados bloqueados en paralelo dejan de ser "un caso puntual" y pasan a
+    # ser una señal sistémica (mismo criterio ya usado para
+    # `auto_recovery_capped`) -- por eso, si la cantidad de posiciones
+    # `sin_confirmar` simultáneas alcanza este tope, la SIGUIENTE sí dispara
+    # el kill-switch GLOBAL, con un mensaje explícito de que es por el tope de
+    # concurrencia, no porque ese caso puntual sea distinto de los demás.
+    real_max_concurrent_sin_confirmar: int = _int_env("REAL_MAX_CONCURRENT_SIN_CONFIRMAR", 2)
+    # Ventana de gracia de reconciliación específica para cuando la posición
+    # pendiente en cuestión es "sin_confirmar" (no "pendiente" genérico, que
+    # sigue usando REAL_RECONCILIATION_GRACE_PERIOD_SECONDS=240s). Antes del
+    # bloqueo per-mercado, un `sin_confirmar` ya disparaba el halt global de
+    # inmediato, así que una ventana de gracia mal calibrada no importaba --
+    # la reconciliación nunca llegaba a correr con el trading real todavía
+    # activo en otros mercados. Ahora sí puede coexistir con exposición real
+    # abierta en otros lados, así que 240s (calibrado para el lag corto de
+    # "pendiente", resolución on-chain ya ocurrida, sólo falta que el job la
+    # marque "cerrada") es demasiado corto: un `sin_confirmar` puede tardar
+    # hasta `REAL_UNCONFIRMED_AUTO_RECOVERY_DELAY_SECONDS` (300s) desde el
+    # intento original antes de que la auto-recuperación siquiera lo revise,
+    # más hasta `RESOLUTION_CHECK_INTERVAL_SECONDS` (180s) hasta que el job
+    # periódico corra ese ciclo. Default 540s = 300 + 180 + 60s de margen --
+    # mismo criterio de margen ya usado entre esos dos números (240 vs 180 =
+    # 60s de buffer, ver arriba). Si coexisten una posición "sin_confirmar" y
+    # una "pendiente", se usa esta ventana más larga (sin_confirmar tiene
+    # prioridad) -- ver `reconciliation._pending_position_grace_seconds`.
+    real_reconciliation_grace_period_sin_confirmar_seconds: float = _float_env(
+        "REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS", 540.0
+    )
+
 
 settings = Settings()

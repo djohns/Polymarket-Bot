@@ -98,6 +98,45 @@ def _has_pending_position(session: Session) -> bool:
     return count > 0
 
 
+def _pending_position_grace_seconds(session: Session) -> float | None:
+    """Qué ventana de gracia usar, según cuál tipo de posición pendiente
+    explica un posible excedente positivo -- agregado 2026-09-14 junto con el
+    bloqueo per-mercado de "sin_confirmar" (ver `execution.real_executor` y
+    CLAUDE.md): antes, un `sin_confirmar` disparaba el halt global de
+    inmediato, así que la reconciliación nunca llegaba a correr con trading
+    real todavía activo en otros mercados -- la ventana genérica de 240s
+    nunca se puso a prueba contra ese caso. Ahora sí puede coexistir con
+    exposición real abierta en otros mercados, y un `sin_confirmar` puede
+    tardar bastante más que 240s en resolverse (hasta
+    `REAL_UNCONFIRMED_AUTO_RECOVERY_DELAY_SECONDS` desde el intento original
+    antes de que la auto-recuperación siquiera lo revise, más el ciclo del
+    job de resolución) -- una ventana de 240s dispararía una falsa alarma
+    sistemáticamente. "sin_confirmar" tiene prioridad si coexiste con
+    "pendiente" genérico (su ventana necesaria es más larga); "pendiente" sin
+    ningún "sin_confirmar" sigue usando la ventana corta ya calibrada para su
+    propio patrón (lag corto entre resolución on-chain y que el job lo
+    marque "cerrada"). Devuelve None si no hay ninguna posición candidata."""
+    has_sin_confirmar = (
+        session.execute(
+            select(func.count()).select_from(RealPosition).where(RealPosition.status == "sin_confirmar")
+        ).scalar_one()
+        > 0
+    )
+    if has_sin_confirmar:
+        return settings.real_reconciliation_grace_period_sin_confirmar_seconds
+
+    has_pendiente = (
+        session.execute(
+            select(func.count()).select_from(RealPosition).where(RealPosition.status == "pendiente")
+        ).scalar_one()
+        > 0
+    )
+    if has_pendiente:
+        return settings.real_reconciliation_grace_period_seconds
+
+    return None
+
+
 def _halt_for_divergence(session: Session, actual_balance_usd: float, expected: float, divergence: float) -> None:
     threshold = settings.real_reconciliation_threshold_usd
     log_event(
@@ -159,12 +198,14 @@ async def check_balance_reconciliation_with_grace(
 
     La tolerancia SÓLO aplica si se cumplen las dos condiciones a la vez:
     divergencia POSITIVA (`actual > expected`, sobra plata) Y al menos una
-    posición en status="pendiente" (candidata a estar resolviendo ahora
-    mismo). En ese caso, en vez de activar el kill-switch de inmediato, se
-    espera `REAL_RECONCILIATION_GRACE_PERIOD_SECONDS` y se vuelve a chequear
-    una sola vez con un balance fresco (`recheck_balance`) y el estado
-    actualizado de `real_positions` -- si para entonces el job ya cerró la
-    posición y la divergencia desapareció, no se hace nada.
+    posición en status="pendiente" o "sin_confirmar" (candidata a estar
+    resolviendo/verificándose ahora mismo). En ese caso, en vez de activar el
+    kill-switch de inmediato, se espera la ventana correspondiente
+    (`_pending_position_grace_seconds` -- más larga si hay un "sin_confirmar"
+    en curso, ver ahí) y se vuelve a chequear una sola vez con un balance
+    fresco (`recheck_balance`) y el estado actualizado de `real_positions` --
+    si para entonces el job ya cerró la posición y la divergencia
+    desapareció, no se hace nada.
 
     CRÍTICO -- esta tolerancia NUNCA aplica a divergencia NEGATIVA (falta
     plata respecto a lo esperado): ese es exactamente el escenario que
@@ -180,13 +221,15 @@ async def check_balance_reconciliation_with_grace(
     if abs(divergence) <= threshold:
         return False
 
-    if divergence > 0 and recheck_balance is not None and _has_pending_position(session):
-        await sleep(settings.real_reconciliation_grace_period_seconds)
-        actual_balance_usd = await recheck_balance()
-        expected = expected_balance_usd(session)
-        divergence = actual_balance_usd - expected
-        if abs(divergence) <= threshold:
-            return False
+    if divergence > 0 and recheck_balance is not None:
+        grace_seconds = _pending_position_grace_seconds(session)
+        if grace_seconds is not None:
+            await sleep(grace_seconds)
+            actual_balance_usd = await recheck_balance()
+            expected = expected_balance_usd(session)
+            divergence = actual_balance_usd - expected
+            if abs(divergence) <= threshold:
+                return False
 
     _halt_for_divergence(session, actual_balance_usd, expected, divergence)
     return True
