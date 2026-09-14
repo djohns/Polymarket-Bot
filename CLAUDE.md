@@ -1842,7 +1842,7 @@ reales en vez de conjeturas. Cubierto en
 `test_sufficient_no_book_depth_does_not_log_an_event` (contraparte, confirma
 que no se genera ruido nuevo cuando la profundidad alcanza).
 
-### Bloqueo per-mercado de sin_confirmar (2026-09-14) — implementado en rama de revisión, no activado en master
+### Bloqueo per-mercado de sin_confirmar (2026-09-14) — revisado, mergeado a master y desplegado
 
 Motivado por la auditoría de downtime del mismo día: 63 de 66 señales
 elegibles perdidas en 48h, la gran mayoría por la ventana de
@@ -1854,8 +1854,27 @@ múltiples `sin_confirmar` paralelos, y complejidad/riesgo nuevo) antes de
 implementar -- el análisis concluyó que era viable sin reescribir la
 arquitectura, pero necesitaba 3 acompañantes obligatorios, no sólo el cambio
 básico. Implementado en la rama `real-executor/per-market-sin-confirmar-halt`,
-**no mergeado a master ni activado** -- pendiente de revisión antes de
-mezclar.
+revisado y aprobado por el usuario, mergeado a `master` (commit `52bea46`) y
+desplegado en la VPS el mismo día -- 138/138 tests en verde tanto en local
+como en la VPS antes del `systemctl restart`, servicio arrancó limpio (sin
+errores en journald, motor/cliente CLOB construidos correctamente pese al
+kill-switch ya activo, mismo comportamiento ya validado en la sección "Fix de
+gating" arriba). El kill-switch en producción **no se tocó** como parte de
+este deploy, por instrucción explícita -- seguía activo por SC Braga
+(`real_positions.id=20`, `status="sin_confirmar"`, único incidente abierto,
+concurrencia 1/2) desde antes del merge, generado bajo el código viejo (por
+eso disparó el halt global de siempre; el cambio no es retroactivo sobre
+incidentes ya en curso). El dashboard regenerado en la VPS después del
+deploy ya refleja el panel nuevo correctamente contra datos reales:
+`rt-auto` (huella conocida, auto-recuperándose) + la fila "Mercados
+bloqueados (sin_confirmar): 1: Will SC Braga win on 2026-09-14?".
+
+**Prueba real pendiente**: la próxima vez que SC Braga se resuelva (auto-
+recuperación con huella conocida, o backfill manual) y aparezca un
+`sin_confirmar` NUEVO en otro mercado, el sistema debería seguir operable en
+el resto en vez de detenerse por completo -- eso es lo que este cambio
+existe para lograr, y todavía no se confirmó contra un caso real (sólo
+contra tests). Confirmar esto en producción la próxima vez que ocurra.
 
 **1. El bloqueo pasa de global a per-mercado**: `_handle_unconfirmed_fill`
 (`execution/real_executor.py`) ya NO llama a `kill_switch.halt()` global por
@@ -1945,10 +1964,11 @@ mercados y un contador para el resto si hay más, para no saturar el panel.
   funciona como se diseñó la próxima vez que aparezca un caso con la huella
   conocida -- hasta ahora sólo está probada con tests, no contra un
   incidente real.
-- Revisar y aprobar la rama `real-executor/per-market-sin-confirmar-halt`
-  (bloqueo per-mercado de sin_confirmar, ver sección arriba) antes de
-  mergearla a master -- no se activó ni se tocó el kill-switch en producción
-  como parte de este trabajo, por instrucción explícita.
+- Confirmar en producción que el bloqueo per-mercado de `sin_confirmar` (ver
+  sección arriba, ya mergeado y desplegado el 2026-09-14) deja el resto del
+  sistema operable la próxima vez que aparezca un `sin_confirmar` nuevo
+  mientras SC Braga (u otro incidente) sigue sin resolver -- todavía sólo
+  probado con tests, no contra un caso real en producción.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
