@@ -368,6 +368,68 @@ def test_leg_imbalance_halts_trading_and_flags_position(request, tmp_path):
         assert positions[0].status == "pendiente"
 
 
+def test_insufficient_no_book_depth_is_persisted_as_event(request, tmp_path):
+    """Antes (2026-09-14): la advertencia de profundidad insuficiente en el
+    book de NO sólo iba al logger de Python -- se perdía sin remedio con la
+    rotación de journald (confirmado en el incidente real de CA Huracán, ya
+    sin rastro apenas ~2h después). Ahora se persiste como evento
+    `insufficient_book_depth`, puramente aditivo -- no cambia el presupuesto
+    que se manda ni ninguna decisión de ejecución."""
+    _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+            {"transactionsHashes": ["0xno"], "orderID": "no-order"},
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": "2.0", "price": "0.50"},
+        ],
+        asks={"no": [{"price": "0.50", "size": "2.0"}]},  # sólo 2 shares disponibles, hacen falta 5.0
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    with session_factory() as session:
+        events = session.execute(select(RealExecutionEvent)).scalars().all()
+        depth_events = [e for e in events if e.event_type == "insufficient_book_depth"]
+        assert len(depth_events) == 1
+        event = depth_events[0]
+        assert event.severity == "warning"
+        assert round(event.detail["required_shares"], 4) == 5.0
+        assert round(event.detail["covered_shares"], 4) == 2.0
+        assert event.detail["best_ask_price"] == 0.5
+        assert round(event.detail["no_budget_usd"], 4) == 1.0  # 2.0 shares x 0.50
+        assert event.detail["no_book_asks"]  # book completo, para diagnóstico
+
+
+def test_sufficient_no_book_depth_does_not_log_an_event(request, tmp_path):
+    """Contraparte -- con profundidad de sobra, no se genera ningún evento
+    nuevo (confirma que el cambio es puramente aditivo)."""
+    _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+            {"transactionsHashes": ["0xno"], "orderID": "no-order"},
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.40"},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": "5.0", "price": "0.50"},
+        ],
+        asks={"no": [{"price": "0.50", "size": "1000"}]},  # profundidad de sobra
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    with session_factory() as session:
+        events = session.execute(select(RealExecutionEvent)).scalars().all()
+        assert not any(e.event_type == "insufficient_book_depth" for e in events)
+
+
 def test_no_leg_sized_by_real_yes_shares_not_fixed_budget(request, tmp_path):
     """Reproduce el bug de sizing descubierto en la auditoría de la 4ta
     activación (ver CLAUDE.md, sección Fase 3): antes, la pata NO se mandaba

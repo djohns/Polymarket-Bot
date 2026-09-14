@@ -118,6 +118,18 @@ completo sin gastar nada (mismo nivel que "no hay fill rentable"). No
 reemplaza `_handle_leg_imbalance` -- sigue siendo la red de seguridad para
 los casos que pasan esta validación previa pero fallan por otra razón en el
 envío real (ver docstring de esa función).
+
+**Advertencia de profundidad insuficiente persistida en la DB (2026-09-14)**:
+la advertencia de "el book de NO no alcanza para cubrir el tamaño real de
+YES" existía desde el rediseño de sizing, pero sólo iba al logger de Python
+-- confirmado en producción que se pierde sin remedio con la rotación de
+journald (el incidente de CA Huracán, `leg_size_mismatch` del 3.9%, ya no
+tenía rastro en journald apenas ~2h después). Ahora también se persiste como
+evento `insufficient_book_depth` (severidad "warning", no crítico -- todavía
+no se sabe si esto va a explicar el desbalance final, sólo es un dato
+adicional) con el book completo, la profundidad cubierta vs. requerida y el
+presupuesto resultante -- puramente aditivo, no cambia qué presupuesto se
+manda ni ninguna decisión de ejecución.
 """
 from __future__ import annotations
 
@@ -566,6 +578,29 @@ class RealExecutionEngine:
                 market.question[:60],
                 yes_shares_real,
                 no_covered,
+            )
+            # Persistido en la DB (2026-09-14, ver CLAUDE.md, sección Fase 3):
+            # antes esto sólo iba al logger de Python -- se perdía sin remedio
+            # con la rotación de journald (confirmado en vivo: ni el incidente
+            # de CA Huracán, de apenas ~2h antes, sobrevivió). Puramente
+            # aditivo, no cambia qué presupuesto se manda ni ninguna decisión
+            # de ejecución -- sólo evita descartar un dato que ya se calculaba.
+            log_event(
+                session,
+                "insufficient_book_depth",
+                "warning",
+                f"Profundidad insuficiente en el book de NO para {market.question[:60]}: "
+                f"se necesitaban {yes_shares_real:.4f} shares, el book en vivo sólo cubre "
+                f"{no_covered:.4f} -- se manda el presupuesto para lo que alcanza",
+                market_id=market.condition_id,
+                real_position_id=position.id,
+                detail={
+                    "required_shares": yes_shares_real,
+                    "covered_shares": no_covered,
+                    "no_budget_usd": no_budget,
+                    "best_ask_price": min(no_asks) if no_asks else None,
+                    "no_book_asks": no_asks,
+                },
             )
 
         try:

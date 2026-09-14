@@ -1742,6 +1742,72 @@ repetirse en la ventana del mismo partido) contra el costo de construir una
 lista de exclusión nueva, sin precedente, con más superficie para un bug
 tipo "mercado bloqueado para siempre sin que nadie se dé cuenta".
 
+### Fix de gating + primera auto-recuperación real exitosa (2026-09-14)
+
+**Bug encontrado durante el deploy de la auto-recuperación**:
+`_build_real_execution_engine()` devolvía `None` de plano si `is_halted()`
+ya estaba activo al arrancar el servicio -- exactamente el escenario en el
+que la auto-recuperación necesita un cliente CLOB para `get_trades`/
+`get_market`. El chequeo era redundante para la seguridad real:
+`RealExecutionEngine.maybe_execute` ya verifica `is_halted()` de forma
+independiente antes de cada intento de orden. Fix: se quita ese chequeo de
+`_build_real_execution_engine` -- el motor/cliente se construye siempre que
+`REAL_TRADING_ENABLED=true`, sin importar el estado del kill-switch;
+`maybe_execute` sigue siendo el único gate real, sin cambios. Test dedicado
+(`test_engine_is_built_even_when_already_halted_but_maybe_execute_still_blocks`
+en `tests/test_main.py`) confirma explícitamente la separación: el motor se
+construye con `is_halted()=True`, pero ninguna orden real se envía.
+
+**Primera auto-recuperación real, confirmada en producción**: con el fix
+desplegado, la posición 16 (CR Flamengo) se auto-recuperó sola sin ninguna
+intervención manual -- verificó ausencia de capital real tras **10,833
+segundos (~3h)** de espera (el job simplemente reintentó en cada ciclo hasta
+que el mercado resolvió), backfilleó `realized_pnl=$0.00`, y el kill-switch
+se levantó solo (`kill_switch_auto_cleared`, sin ningún otro incidente
+abierto). Los 3 eventos (`position_resolved`, `auto_recovered_unconfirmed_fill`,
+`kill_switch_auto_cleared`) quedaron persistidos con severidad CRITICAL y
+`detail` completo, exactamente como se diseñó.
+
+### Incidente de `leg_size_mismatch` (CA Huracán, 2026-09-14) — categoría no cubierta por la auto-recuperación
+
+Tras la reactivación automática, la siguiente ejecución real (posición 17,
+"Will CA Huracán win on 2026-09-13?") terminó en un kill-switch por
+**desbalance residual de 3.9%** (ambas patas confirmaron con shares reales,
+pero no calzan más allá del umbral del 2%) -- **no es `sin_confirmar` ni leg
+imbalance por falla de red**, es el mecanismo `leg_size_mismatch` ya
+existente desde el rediseño de sizing. **No está cubierto por la
+auto-recuperación actual** (que sólo automatiza `sin_confirmar` con huella
+exacta) -- sigue siendo manual por diseño, mismo criterio que drawdown y leg
+imbalance de red.
+
+**Investigación pedida (sólo lectura, sin cambios)**: comparando los 6 casos
+históricos de desbalance residual (Santa Fe 10.6%, HJK 24.2%, Barcelona/
+Feyenoord 20.3%, San Diego FC 14.6%, Kashiwa Reysol 0.17%, Huracán 3.9%),
+**ningún indicador disponible en la DB separa los casos grandes de los
+chicos** -- ni tiempo transcurrido entre confirmar YES y completar NO, ni
+cuánto se movió el book en la pata YES (estimado vs. real), ni qué tan
+sesgado está el mercado. El hallazgo más importante no fue un patrón sino un
+**gap de diagnóstico**: la advertencia de "profundidad insuficiente en el
+book de NO" (ya calculada en el código desde el rediseño de sizing) sólo iba
+al logger de Python -- confirmado en vivo que se pierde sin remedio con la
+rotación de journald (ni el incidente de Huracán, de apenas ~2h antes, tenía
+rastro). Sin eso, es imposible saber si un desbalance se debió a falta de
+profundidad real o simplemente a que el precio se movió entre consultar el
+book y ejecutar la orden -- dos causas con implicancias muy distintas.
+
+**Fix implementado**: la advertencia ahora también se persiste como evento
+`insufficient_book_depth` (severidad "warning", no crítico -- todavía no se
+sabe si esto explica el desbalance, es sólo un dato adicional) con
+`detail`: shares requeridas vs. cubiertas, presupuesto resultante, mejor
+precio ask, y el book completo de NO en ese momento -- puramente aditivo,
+no cambia qué presupuesto se envía ni ninguna decisión de ejecución. Con
+esto, los próximos incidentes de este tipo van a poder analizarse con datos
+reales en vez de conjeturas. Cubierto en
+`tests/test_execution_real_executor.py`:
+`test_insufficient_no_book_depth_is_persisted_as_event`,
+`test_sufficient_no_book_depth_does_not_log_an_event` (contraparte, confirma
+que no se genera ruido nuevo cuando la profundidad alcanza).
+
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
