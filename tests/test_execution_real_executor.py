@@ -34,6 +34,18 @@ SPORTS_MARKET_WITH_FEE = MarketInfo(
     sports_market_type="moneyline",
 )
 
+SPORTS_MARKET_2 = MarketInfo(
+    condition_id="0xsport2",
+    question="¿Gana la visita?",
+    yes_token_id="yes2b",
+    no_token_id="no2b",
+    fee_rate=0.0,
+    fee_exponent=1.0,
+    fees_enabled=False,
+    cluster_id="event-2b",
+    sports_market_type="moneyline",
+)
+
 NON_SPORTS_MARKET = MarketInfo(
     condition_id="0xlong",
     question="¿Habrá acuerdo?",
@@ -669,11 +681,16 @@ def test_confirmed_fill_uses_real_value_after_transient_get_trades_lag(request, 
         assert pos.no_price_avg == 0.51
 
 
-def test_unconfirmed_fill_after_exhausting_retries_marks_sin_confirmar_and_halts(request, tmp_path):
+def test_unconfirmed_fill_after_exhausting_retries_marks_sin_confirmar_and_locks_only_that_market(
+    request, tmp_path
+):
     """Si `get_trades` sigue sin encontrar el trade después de todos los
     reintentos, el sistema NO debe asumir que la canasta quedó calzada (el
     bug del incidente del 2026-09-11) -- debe marcar la posición
-    "sin_confirmar" y activar el kill-switch, igual que un leg imbalance."""
+    "sin_confirmar". Desde el bloqueo per-mercado (2026-09-14), por debajo
+    del tope de concurrencia esto YA NO activa el kill-switch GLOBAL -- sólo
+    bloquea nuevas órdenes en ESE mercado (ver
+    `test_second_market_keeps_operating_while_first_is_locked_by_sin_confirmar`)."""
     flag = _enable_real_trading(request, tmp_path)
     session_factory = _session_factory()
     client = FakeClient(
@@ -692,7 +709,7 @@ def test_unconfirmed_fill_after_exhausting_retries_marks_sin_confirmar_and_halts
 
     engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
 
-    assert kill_switch.is_halted(str(flag)) is True
+    assert kill_switch.is_halted(str(flag)) is False
     with session_factory() as session:
         positions = session.execute(select(RealPosition)).scalars().all()
         assert len(positions) == 1
@@ -727,7 +744,7 @@ def test_unconfirmed_yes_fill_persists_raw_response_in_detail(request, tmp_path)
 
     engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
 
-    assert kill_switch.is_halted(str(flag)) is True
+    assert kill_switch.is_halted(str(flag)) is False
     with session_factory() as session:
         pos = session.execute(select(RealPosition)).scalars().one()
         assert pos.status == "sin_confirmar"
@@ -736,6 +753,119 @@ def test_unconfirmed_yes_fill_persists_raw_response_in_detail(request, tmp_path)
         fill_not_confirmed = next(e for e in events if e.event_type == "fill_not_confirmed")
         assert fill_not_confirmed.detail is not None
         assert fill_not_confirmed.detail["raw_response"] == {"transactionsHashes": ["0xyes"], "orderID": "yes-order"}
+
+
+def test_second_market_keeps_operating_while_first_is_locked_by_sin_confirmar(request, tmp_path):
+    """Núcleo del bloqueo per-mercado (2026-09-14): un mercado con
+    `sin_confirmar` en curso no manda más órdenes ahí, pero un mercado
+    DISTINTO sigue operando con total normalidad -- exactamente lo que la
+    auditoría de downtime (63/66 señales elegibles perdidas en 48h) pedía
+    resolver."""
+    _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+
+    with session_factory() as session:
+        session.add(
+            RealPosition(
+                market_id=SPORTS_MARKET.condition_id,
+                cluster_id=SPORTS_MARKET.cluster_id,
+                question=SPORTS_MARKET.question,
+                status="sin_confirmar",
+                yes_shares=5.0,
+                no_shares=0.0,
+                yes_price_avg=0.40,
+                no_price_avg=0.0,
+                cost_usd=2.0,
+                fee_paid=0.0,
+                net_pnl_expected=0.5,
+            )
+        )
+        session.commit()
+
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes2"], "orderID": "yes-order-2"},
+            {"transactionsHashes": ["0xno2"], "orderID": "no-order-2"},
+        ],
+        trades=[
+            {"taker_order_id": "yes-order-2", "status": "CONFIRMED", "size": "5.0", "price": "0.40"},
+            {"taker_order_id": "no-order-2", "status": "CONFIRMED", "size": "5.0", "price": "0.50"},
+        ],
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    # Mercado bloqueado: ningún intento de orden.
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+    assert client.calls == []
+
+    # Mercado distinto: opera normalmente, ambas patas se envían y la
+    # posición queda abierta.
+    engine.maybe_execute(SPORTS_MARKET_2, _book("yes2b", {0.40: 100.0}), _book("no2b", {0.50: 100.0}))
+    assert len(client.calls) == 2
+    assert client.calls[0][0] == "yes2b"
+    assert client.calls[1][0] == "no2b"
+
+    with session_factory() as session:
+        positions = {p.market_id: p for p in session.execute(select(RealPosition)).scalars().all()}
+        assert positions[SPORTS_MARKET.condition_id].status == "sin_confirmar"  # sin tocar
+        assert positions[SPORTS_MARKET_2.condition_id].status == "abierta"
+
+
+def test_concurrency_cap_reached_forces_global_halt(request, tmp_path):
+    """Con `REAL_MAX_CONCURRENT_SIN_CONFIRMAR=2`, la 2da posición sin_confirmar
+    concurrente cruza el tope y SÍ dispara el kill-switch GLOBAL -- señal
+    sistémica, no un caso puntual (mismo criterio que `auto_recovery_capped`)."""
+    flag = _enable_real_trading(request, tmp_path)
+    object.__setattr__(settings, "real_max_concurrent_sin_confirmar", 2)
+    request.addfinalizer(lambda: object.__setattr__(settings, "real_max_concurrent_sin_confirmar", 2))
+    session_factory = _session_factory()
+
+    with session_factory() as session:
+        session.add(
+            RealPosition(
+                market_id=SPORTS_MARKET.condition_id,
+                cluster_id=SPORTS_MARKET.cluster_id,
+                question=SPORTS_MARKET.question,
+                status="sin_confirmar",
+                yes_shares=5.0,
+                no_shares=0.0,
+                yes_price_avg=0.40,
+                no_price_avg=0.0,
+                cost_usd=2.0,
+                fee_paid=0.0,
+                net_pnl_expected=0.5,
+            )
+        )
+        session.commit()
+
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes2"], "orderID": "yes-order-2"},
+            {"transactionsHashes": ["0xno2"], "orderID": "no-order-2"},
+        ],
+        trades_sequence=[
+            [{"taker_order_id": "yes-order-2", "status": "CONFIRMED", "size": "5.0", "price": "0.40"}],
+            [],  # NO de este 2do mercado tampoco confirma -> 2do sin_confirmar concurrente
+            [],
+            [],
+        ],
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET_2, _book("yes2b", {0.40: 100.0}), _book("no2b", {0.50: 100.0}))
+
+    assert kill_switch.is_halted(str(flag)) is True
+    with session_factory() as session:
+        events = session.execute(select(RealExecutionEvent)).scalars().all()
+        event_types = {e.event_type for e in events}
+        assert "sin_confirmar_concurrency_capped" in event_types
+
+        capped_event = next(e for e in events if e.event_type == "sin_confirmar_concurrency_capped")
+        assert capped_event.detail["concurrent_sin_confirmar"] == 2
+        assert capped_event.detail["max_concurrent"] == 2
+
+        triggered = next(e for e in events if e.event_type == "kill_switch_triggered")
+        assert "tope de concurrencia" in triggered.message.lower()
 
 
 def test_execution_events_are_persisted_to_db(request, tmp_path):

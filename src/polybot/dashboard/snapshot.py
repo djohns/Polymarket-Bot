@@ -37,19 +37,29 @@ _FLAG_LINE_RE = re.compile(r"^(?P<ts>\S+)\s+--\s+(?P<reason>.*)$")
 
 @dataclass
 class RealTradingStatus:
-    """`state`: "activo" (operable, sin halt) | "manual" (detenido, requiere
-    luz verde explícita del usuario -- drawdown, leg imbalance de red,
-    leg_size_mismatch, sin_confirmar con huella no reconocida o con el tope
-    de auto-recuperaciones ya alcanzado) | "auto_recuperando" (detenido por
-    un `sin_confirmar` con la huella exacta ya caracterizada, todavía dentro
-    del proceso de auto-recuperación -- ver `real_resolution_job.py` --, se
-    puede resolver solo sin intervención)."""
+    """`state`: "activo" (operable, sin halt GLOBAL) | "manual" (halt GLOBAL,
+    requiere luz verde explícita del usuario -- drawdown, leg imbalance de
+    red, leg_size_mismatch, tope de concurrencia de sin_confirmar alcanzado,
+    o sin_confirmar con el tope de auto-recuperaciones ya agotado) |
+    "auto_recuperando" (halt GLOBAL por un caso todavía dentro del proceso de
+    auto-recuperación, ver `real_resolution_job.py`).
+
+    `locked_markets` (2026-09-14, ver `execution.real_executor` y CLAUDE.md,
+    bloqueo per-mercado de sin_confirmar): desde este cambio, un
+    `sin_confirmar` normalmente YA NO causa un halt GLOBAL -- sólo bloquea
+    nuevas órdenes en su propio mercado (`RealExecutionEngine.maybe_execute`
+    vía `_market_locked_by_unconfirmed`). Por eso `state` puede seguir
+    mostrando "activo" (sin halt global) mientras 1 o más mercados están
+    bloqueados en paralelo -- este campo es independiente de `state`, lista
+    (market_id, question) de cada mercado actualmente bloqueado por
+    sin_confirmar, para que el panel no oculte esa situación."""
 
     enabled: bool
     halted: bool
     halt_reason: str | None
     halted_since: dt.datetime | None
     state: str  # "activo" | "manual" | "auto_recuperando"
+    locked_markets: list[tuple[str, str]] = field(default_factory=list)  # (market_id, question)
 
 
 def _read_kill_switch_flag(path: str) -> tuple[dt.datetime | None, str | None]:
@@ -73,10 +83,35 @@ def _read_kill_switch_flag(path: str) -> tuple[dt.datetime | None, str | None]:
     return when, match.group("reason")
 
 
+def _locked_markets(session: Session) -> list[tuple[str, str]]:
+    """Mercados actualmente bloqueados por un `sin_confirmar` en curso --
+    independiente de si hay o no un halt GLOBAL activo (ver docstring de
+    `RealTradingStatus`). Se toma `question` de la fila más reciente por
+    mercado (hay a lo sumo una `sin_confirmar` por mercado en la práctica,
+    ver `real_executor._market_locked_by_unconfirmed`, pero no se asume)."""
+    rows = session.execute(
+        select(RealPosition.market_id, RealPosition.question)
+        .where(RealPosition.status == "sin_confirmar")
+        .order_by(RealPosition.opened_at.desc())
+    ).all()
+    seen: dict[str, str] = {}
+    for market_id, question in rows:
+        seen.setdefault(market_id, question)
+    return list(seen.items())
+
+
 def _build_real_trading_status(session: Session) -> RealTradingStatus:
+    locked_markets = _locked_markets(session)
     halted = kill_switch.is_halted()
     if not halted:
-        return RealTradingStatus(enabled=settings.real_trading_enabled, halted=False, halt_reason=None, halted_since=None, state="activo")
+        return RealTradingStatus(
+            enabled=settings.real_trading_enabled,
+            halted=False,
+            halt_reason=None,
+            halted_since=None,
+            state="activo",
+            locked_markets=locked_markets,
+        )
 
     halted_since, halt_reason = _read_kill_switch_flag(settings.real_kill_switch_flag_path)
 
@@ -109,6 +144,7 @@ def _build_real_trading_status(session: Session) -> RealTradingStatus:
         halt_reason=halt_reason,
         halted_since=halted_since,
         state=state,
+        locked_markets=locked_markets,
     )
 
 

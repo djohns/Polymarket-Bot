@@ -145,6 +145,22 @@ def _real_trading_panel(status: RealTradingStatus, generated_at: dt.datetime) ->
     else:
         rows.append('<div class="rt-row"><span class="rt-key">Kill-switch</span><span>Sin activar</span></div>')
 
+    # Bloqueo per-mercado de sin_confirmar (2026-09-14, ver CLAUDE.md):
+    # independiente del halt GLOBAL -- puede haber mercados bloqueados aunque
+    # state=="activo" (kill-switch global sin activar), ver docstring de
+    # RealTradingStatus. Se muestra el detalle (pregunta de cada mercado)
+    # sólo si la cantidad es chica, para no saturar el panel.
+    locked = status.locked_markets
+    if locked:
+        if len(locked) <= 3:
+            detail = "; ".join(_esc(question[:50]) for _, question in locked)
+        else:
+            detail = "; ".join(_esc(question[:50]) for _, question in locked[:3]) + f"; +{len(locked) - 3} más"
+        rows.append(
+            '<div class="rt-row"><span class="rt-key">Mercados bloqueados (sin_confirmar)</span>'
+            f"<span>{len(locked)}: {detail}</span></div>"
+        )
+
     return f"""
 <div class="real-trading-panel {state_class}">
   <div class="rt-header"><span class="rt-dot"></span><strong>Fase 3 (trading real): {_esc(label)}</strong></div>

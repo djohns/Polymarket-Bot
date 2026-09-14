@@ -1767,12 +1767,14 @@ también puede generar un excedente positivo benigno mientras se verifica.
 **Variables nuevas en `.env`**: `REAL_UNCONFIRMED_AUTO_RECOVERY_DELAY_SECONDS`
 (300.0), `REAL_AUTO_RECOVERY_MAX_PER_WINDOW` (3), `REAL_AUTO_RECOVERY_WINDOW_HOURS` (72.0).
 
-**No implementado a propósito, descartado en la discusión**: bloqueo por
-mercado específico en vez de global -- el beneficio real es chico (cada
-incidente histórico fue un mercado distinto que de todos modos no iba a
-repetirse en la ventana del mismo partido) contra el costo de construir una
-lista de exclusión nueva, sin precedente, con más superficie para un bug
-tipo "mercado bloqueado para siempre sin que nadie se dé cuenta".
+**Nota (2026-09-14, revisado más abajo)**: en esta sección se había descartado
+un bloqueo por mercado específico ("el beneficio real es chico... contra el
+costo de construir una lista de exclusión nueva"). Una auditoría posterior el
+mismo día (63 de 66 señales elegibles perdidas por downtime en 48h,
+mayoritariamente por la ventana de auto-recuperación de `sin_confirmar`)
+mostró que esa estimación de beneficio era incorrecta a la luz de datos
+reales -- ver "Bloqueo per-mercado de sin_confirmar" más abajo, que
+reemplaza esta decisión.
 
 ### Fix de gating + primera auto-recuperación real exitosa (2026-09-14)
 
@@ -1840,6 +1842,92 @@ reales en vez de conjeturas. Cubierto en
 `test_sufficient_no_book_depth_does_not_log_an_event` (contraparte, confirma
 que no se genera ruido nuevo cuando la profundidad alcanza).
 
+### Bloqueo per-mercado de sin_confirmar (2026-09-14) — implementado en rama de revisión, no activado en master
+
+Motivado por la auditoría de downtime del mismo día: 63 de 66 señales
+elegibles perdidas en 48h, la gran mayoría por la ventana de
+auto-recuperación de `sin_confirmar` (2-3h por incidente) bloqueando TODO el
+sistema aunque el riesgo real está acotado a ese mercado puntual. Se pidió
+primero un análisis de viabilidad/riesgo (4 preguntas: factibilidad técnica,
+suficiencia de los topes de exposición, correctitud de la reconciliación con
+múltiples `sin_confirmar` paralelos, y complejidad/riesgo nuevo) antes de
+implementar -- el análisis concluyó que era viable sin reescribir la
+arquitectura, pero necesitaba 3 acompañantes obligatorios, no sólo el cambio
+básico. Implementado en la rama `real-executor/per-market-sin-confirmar-halt`,
+**no mergeado a master ni activado** -- pendiente de revisión antes de
+mezclar.
+
+**1. El bloqueo pasa de global a per-mercado**: `_handle_unconfirmed_fill`
+(`execution/real_executor.py`) ya NO llama a `kill_switch.halt()` global por
+defecto. En cambio, mientras la fila siga en `status="sin_confirmar"`,
+`RealExecutionEngine.maybe_execute` la detecta vía un segundo gate
+(`_market_locked_by_unconfirmed`, un `EXISTS` por `market_id`) y omite
+silenciosamente nuevas órdenes en ESE mercado puntual -- el resto del
+sistema sigue operando con normalidad. Los otros 3 tipos de incidente
+(drawdown por equity, leg imbalance por falla de red, `leg_size_mismatch`)
+siguen bloqueando todo el sistema globalmente sin excepción, sin ningún
+cambio en sus call sites.
+
+**2. Tope de concurrencia (`REAL_MAX_CONCURRENT_SIN_CONFIRMAR`, default 2)**:
+los topes de exposición en dólares (`_real_exposure`) ya eran suficientes
+como red de capital -- ya incluían `sin_confirmar` y ya son por
+mercado/cluster/total, así que el bloqueo per-mercado no aumenta el capital
+en riesgo. Pero no había ningún tope sobre la *cantidad* de incidentes
+`sin_confirmar` simultáneos, que sí importa como señal de que el patrón
+"conocido" dejó de comportarse como se espera. Si la cantidad de
+`sin_confirmar` concurrentes (en mercados distintos) alcanza el tope, la
+posición que lo cruza SÍ dispara el kill-switch GLOBAL, con un evento
+dedicado (`sin_confirmar_concurrency_capped`) que dice explícitamente que es
+por el tope, no porque ese caso puntual sea distinto -- mismo criterio ya
+usado en `auto_recovery_capped`.
+
+**3. Ventana de gracia de reconciliación específica para sin_confirmar**:
+antes del bloqueo per-mercado, un `sin_confirmar` disparaba el halt global
+de inmediato, así que la ventana de gracia genérica de 240s
+(`REAL_RECONCILIATION_GRACE_PERIOD_SECONDS`, calibrada para "pendiente")
+nunca se ponía a prueba contra ese caso -- la reconciliación no llegaba a
+correr con trading real todavía activo en otros mercados. Ahora sí puede
+coexistir con exposición real abierta en otros lados, y 240s es demasiado
+corto: un `sin_confirmar` puede tardar hasta
+`REAL_UNCONFIRMED_AUTO_RECOVERY_DELAY_SECONDS` (300s) desde el intento
+original antes de que la auto-recuperación siquiera lo revise, más hasta
+`RESOLUTION_CHECK_INTERVAL_SECONDS` (180s) hasta que el job periódico corra
+ese ciclo. Nueva variable `REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS`
+(default 540s = 300 + 180 + 60s de margen, mismo criterio de buffer ya usado
+entre 240 y 180). `reconciliation._pending_position_grace_seconds` decide
+cuál ventana usar: si coexiste un `sin_confirmar` con un `pendiente`
+genérico, se usa la más larga (la de sin_confirmar). La asimetría existente
+(sólo divergencia POSITIVA recibe cualquier margen; negativa dispara
+siempre de inmediato, sin importar el tipo de posición pendiente) no cambió.
+
+**4. Dashboard**: `RealTradingStatus` (`dashboard/snapshot.py`) gana un
+campo `locked_markets` (lista de `(market_id, question)`), independiente de
+`state`/`halted` -- con el bloqueo per-mercado, el panel puede seguir
+mostrando "activo" (sin halt global) mientras 1+ mercados están bloqueados
+en paralelo, y el punto de este cambio es justamente que eso no quede
+oculto. El panel (`dashboard/render.py`) muestra una fila nueva sólo si hay
+al menos un mercado bloqueado, con el detalle (pregunta) de hasta 3
+mercados y un contador para el resto si hay más, para no saturar el panel.
+
+**Tests**: `test_second_market_keeps_operating_while_first_is_locked_by_sin_confirmar`,
+`test_concurrency_cap_reached_forces_global_halt`,
+`test_unconfirmed_fill_after_exhausting_retries_marks_sin_confirmar_and_locks_only_that_market`
+(en `test_execution_real_executor.py`);
+`test_positive_divergence_with_sin_confirmar_position_self_heals_within_grace_window`
+(actualizado a la ventana específica),
+`test_sin_confirmar_grace_window_takes_priority_over_generic_pending_window`,
+`test_negative_divergence_halts_immediately_regardless_of_pending_position_type`
+(en `test_execution_reconciliation.py`);
+`test_real_trading_status_lists_locked_markets_even_when_active`,
+`test_real_trading_status_no_locked_markets_when_none_sin_confirmar` (en
+`test_dashboard_snapshot.py`); `test_locked_markets_shown_even_when_state_is_activo`,
+`test_no_locked_markets_row_when_none_are_blocked`,
+`test_many_locked_markets_shows_count_and_truncates_detail` (en
+`test_dashboard_render.py`).
+
+**Variables nuevas en `.env`**: `REAL_MAX_CONCURRENT_SIN_CONFIRMAR` (2),
+`REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS` (540.0).
+
 ### Pendiente para la próxima activación
 
 - Repetir el checklist de verificación pre-go-live completo (los mismos 7
@@ -1857,6 +1945,10 @@ que no se genera ruido nuevo cuando la profundidad alcanza).
   funciona como se diseñó la próxima vez que aparezca un caso con la huella
   conocida -- hasta ahora sólo está probada con tests, no contra un
   incidente real.
+- Revisar y aprobar la rama `real-executor/per-market-sin-confirmar-halt`
+  (bloqueo per-mercado de sin_confirmar, ver sección arriba) antes de
+  mergearla a master -- no se activó ni se tocó el kill-switch en producción
+  como parte de este trabajo, por instrucción explícita.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 

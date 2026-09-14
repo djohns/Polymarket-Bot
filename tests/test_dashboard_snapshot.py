@@ -192,6 +192,33 @@ def test_real_trading_status_active_when_not_halted(tmp_path):
     assert status.state == "activo"
 
 
+def test_real_trading_status_lists_locked_markets_even_when_active(tmp_path):
+    """Bloqueo per-mercado (2026-09-14): un `sin_confirmar` normalmente ya NO
+    causa un halt GLOBAL (ver `execution.real_executor`), así que `state`
+    puede seguir "activo" mientras 1+ mercados están bloqueados en paralelo
+    -- `locked_markets` es independiente de `state`/`halted`."""
+    flag = tmp_path / "HALT"
+    session = _session()
+    _unconfirmed_position(session, market_id="0xabc", question="¿Gana A?")
+    _unconfirmed_position(session, market_id="0xdef", question="¿Gana B?")
+
+    with _override(real_trading_enabled=True, real_kill_switch_flag_path=str(flag)):
+        status = _build_real_trading_status(session)
+
+    assert status.halted is False
+    assert status.state == "activo"
+    assert sorted(status.locked_markets) == [("0xabc", "¿Gana A?"), ("0xdef", "¿Gana B?")]
+
+
+def test_real_trading_status_no_locked_markets_when_none_sin_confirmar(tmp_path):
+    flag = tmp_path / "HALT"
+    session = _session()
+    with _override(real_trading_enabled=True, real_kill_switch_flag_path=str(flag)):
+        status = _build_real_trading_status(session)
+
+    assert status.locked_markets == []
+
+
 def test_real_trading_status_manual_for_non_sin_confirmar_halt(tmp_path):
     """Drawdown, leg imbalance de red, leg_size_mismatch, reconciliación --
     cualquier causa que no sea "fill sin confirmar" es manual de entrada."""

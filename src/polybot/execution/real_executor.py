@@ -119,6 +119,30 @@ reemplaza `_handle_leg_imbalance` -- sigue siendo la red de seguridad para
 los casos que pasan esta validación previa pero fallan por otra razón en el
 envío real (ver docstring de esa función).
 
+**Bloqueo per-mercado de "sin_confirmar" (2026-09-14, ver CLAUDE.md sección
+Fase 3, análisis de viabilidad previo a este cambio)**: un `sin_confirmar`
+ya no detiene TODO el sistema -- el riesgo real está acotado a esa
+posición/mercado específico (no hay razón estructural para que bloquee
+mercados no relacionados). `_handle_unconfirmed_fill` ya NO llama a
+`kill_switch.halt()` global por defecto; en cambio, mientras la fila siga en
+`status="sin_confirmar"`, `maybe_execute` la detecta vía
+`_market_locked_by_unconfirmed` (un segundo gate, independiente del global
+`is_halted()`) y omite silenciosamente nuevas órdenes en ESE
+`market_id` puntual -- el resto del sistema sigue operando con normalidad.
+Los otros 3 tipos de incidente (drawdown por equity, leg imbalance por falla
+de red, `leg_size_mismatch`) siguen bloqueando todo el sistema globalmente
+sin excepción -- eso no cambió, son señales de posible problema sistémico,
+no acotadas a un mercado.
+
+Salvaguarda de concurrencia: varios mercados bloqueados en paralelo dejan de
+ser "un caso puntual" -- si la cantidad de posiciones `sin_confirmar`
+simultáneas alcanza `REAL_MAX_CONCURRENT_SIN_CONFIRMAR` (default 2), la
+posición que cruza ese tope SÍ dispara el kill-switch GLOBAL (mismo
+criterio que `auto_recovery_capped`: el mensaje deja explícito que es por el
+tope, no porque ese caso puntual sea distinto). Sin esto, el bloqueo
+per-mercado por sí solo no tendría ninguna señal de que el patrón "conocido"
+empezó a repetirse con una frecuencia anormal.
+
 **Advertencia de profundidad insuficiente persistida en la DB (2026-09-14)**:
 la advertencia de "el book de NO no alcanza para cubrir el tamaño real de
 YES" existía desde el rediseño de sizing, pero sólo iba al logger de Python
@@ -170,6 +194,34 @@ def _real_exposure(session: Session, *, market_id: str | None = None, cluster_id
     if cluster_id is not None:
         stmt = stmt.where(RealPosition.cluster_id == cluster_id)
     return session.execute(stmt).scalar_one()
+
+
+def _market_locked_by_unconfirmed(session: Session, market_id: str) -> bool:
+    """True si ESE mercado puntual tiene una posición `sin_confirmar` en
+    curso -- el bloqueo per-mercado del 2026-09-14 (ver docstring del módulo):
+    mientras la fila siga en ese status, no se manda una orden real nueva en
+    este mercado, pero el resto del sistema no se ve afectado. Se limpia solo
+    en cuanto la posición deja de estar `sin_confirmar` (auto-recuperada,
+    backfilleada a mano, o resuelta), sin ningún estado adicional que
+    mantener."""
+    return (
+        session.execute(
+            select(func.count())
+            .select_from(RealPosition)
+            .where(RealPosition.status == "sin_confirmar", RealPosition.market_id == market_id)
+        ).scalar_one()
+        > 0
+    )
+
+
+def _concurrent_sin_confirmar_count(session: Session) -> int:
+    """Cantidad total de posiciones `sin_confirmar` abiertas en este momento,
+    sin importar el mercado -- usada para decidir si se cruzó el tope de
+    concurrencia (`REAL_MAX_CONCURRENT_SIN_CONFIRMAR`), la única señal
+    sistémica que le queda al bloqueo per-mercado (ver docstring del módulo)."""
+    return session.execute(
+        select(func.count()).select_from(RealPosition).where(RealPosition.status == "sin_confirmar")
+    ).scalar_one()
 
 
 def _place_market_buy(client, token_id: str, budget_usd: float) -> dict:
@@ -419,6 +471,14 @@ class RealExecutionEngine:
             return
 
         with self._session_factory() as session:
+            if _market_locked_by_unconfirmed(session, market.condition_id):
+                logger.debug(
+                    "Mercado %s bloqueado por un sin_confirmar en curso, se omite ejecución real "
+                    "(el resto del sistema sigue operando con normalidad)",
+                    market.question[:60],
+                )
+                return
+
             market_exposure = _real_exposure(session, market_id=market.condition_id)
             cluster_exposure = _real_exposure(session, cluster_id=market.cluster_id)
             total_exposure = _real_exposure(session)
@@ -744,13 +804,26 @@ class RealExecutionEngine:
         `get_trades` nunca encontró el trade real). Sirve para verificar en el
         próximo caso si la respuesta trae alguna señal temprana de "no
         matcheó" (`status`/`errorMsg`) que permita saltar los reintentos --
-        ver CLAUDE.md, sección Fase 3, investigación pendiente (Paso 2)."""
+        ver CLAUDE.md, sección Fase 3, investigación pendiente (Paso 2).
+
+        **Bloqueo per-mercado, no global (2026-09-14)**: a diferencia de un
+        leg imbalance total o un `leg_size_mismatch` (ver docstring del
+        módulo), este incidente ya NO dispara el kill-switch GLOBAL por
+        defecto -- el riesgo real está acotado a este `market_id`, y
+        `RealExecutionEngine.maybe_execute` lo bloquea vía
+        `_market_locked_by_unconfirmed` mientras la fila siga en este status.
+        Sólo si la cantidad de posiciones `sin_confirmar` concurrentes cruza
+        `REAL_MAX_CONCURRENT_SIN_CONFIRMAR` se trata como señal sistémica y
+        SÍ se dispara el halt global (mismo criterio que `auto_recovery_capped`:
+        el mensaje deja explícito que es por el tope de concurrencia, no
+        porque este caso puntual sea distinto de los demás)."""
         position.status = "sin_confirmar"
         position.notes = (
             f"No se pudo confirmar el fill real de la pata {leg} tras reintentar "
             "get_trades (posible lag de indexación del exchange) -- el sistema NO "
             "puede garantizar que la canasta esté calzada ni el costo real. "
-            "Requiere revisión manual antes de continuar."
+            "Bloquea sólo este mercado (no todo el sistema) mientras se revisa/"
+            "auto-recupera."
         )
         session.commit()
 
@@ -759,13 +832,40 @@ class RealExecutionEngine:
             "fill_not_confirmed",
             "critical",
             f"No se pudo confirmar el fill real de la pata {leg} en {position.question[:60]} "
-            "tras reintentar -- posición marcada sin_confirmar, no se asume canasta calzada",
+            "tras reintentar -- posición marcada sin_confirmar, bloqueando sólo este mercado",
             market_id=position.market_id,
             real_position_id=position.id,
             detail={"raw_response": raw_response} if raw_response is not None else None,
         )
-        kill_switch.halt(
-            f"fill sin confirmar en mercado {position.market_id} (pata {leg}) -- "
-            "no se puede garantizar el estado real de la posición",
-            session=session,
-        )
+
+        concurrent = _concurrent_sin_confirmar_count(session)
+        if concurrent >= settings.real_max_concurrent_sin_confirmar:
+            log_event(
+                session,
+                "sin_confirmar_concurrency_capped",
+                "critical",
+                f"Tope de concurrencia de sin_confirmar alcanzado ({concurrent}/"
+                f"{settings.real_max_concurrent_sin_confirmar}) -- se activa el kill-switch "
+                f"GLOBAL como señal sistémica, no porque el mercado {position.market_id} en "
+                "particular sea distinto de los demás mercados ya bloqueados",
+                market_id=position.market_id,
+                real_position_id=position.id,
+                detail={
+                    "concurrent_sin_confirmar": concurrent,
+                    "max_concurrent": settings.real_max_concurrent_sin_confirmar,
+                },
+            )
+            kill_switch.halt(
+                f"tope de concurrencia de sin_confirmar alcanzado ({concurrent}/"
+                f"{settings.real_max_concurrent_sin_confirmar}) -- posible problema "
+                "sistémico, no acotado a un mercado",
+                session=session,
+            )
+        else:
+            logger.info(
+                "Fill sin confirmar en mercado %s -- se bloquea sólo ESE mercado "
+                "(%d/%d sin_confirmar concurrentes), el resto del sistema sigue operando",
+                position.market_id,
+                concurrent,
+                settings.real_max_concurrent_sin_confirmar,
+            )
