@@ -12,15 +12,50 @@ que alguien audite a mano para notarlo.
 
 Tolerancia asimétrica agregada el 2026-09-12 (ver
 `check_balance_reconciliation_with_grace`): una divergencia POSITIVA (sobra
-plata) con una posición "pendiente" o "sin_confirmar" en curso (extendido el
-2026-09-14, ver `_has_pending_position`) puede ser sólo el lag benigno
+plata) con una posición "pendiente" en curso puede ser sólo el lag benigno
 entre una resolución on-chain y que `real_resolution_job` la marque
 "cerrada" (confirmado 2 veces: Santa Fe, Al Ittihad) -- se le da un margen
-corto antes de decidir. Una divergencia NEGATIVA (falta plata) NUNCA recibe
-ese margen: podría ser una pérdida real o un bug nuevo (como el incidente
-original del 2026-09-08, que fue de signo negativo), así que dispara el
-kill-switch de inmediato siempre, sin excepción. La asimetría es deliberada,
-no un descuido -- no darle el mismo trato a ambos signos.
+corto (`REAL_RECONCILIATION_GRACE_PERIOD_SECONDS`, 240s) antes de decidir.
+Una divergencia NEGATIVA (falta plata) NUNCA recibe ese margen: podría ser
+una pérdida real o un bug nuevo (como el incidente original del 2026-09-08,
+que fue de signo negativo), así que dispara el kill-switch de inmediato
+siempre, sin excepción. La asimetría es deliberada, no un descuido -- no
+darle el mismo trato a ambos signos.
+
+**"sin_confirmar" NO usa una ventana de gracia -- usa exclusión aritmética
+(2026-09-15, reemplaza el intento anterior del 2026-09-14 de agrandar la
+ventana)**: el 2026-09-14 se le dio a "sin_confirmar" su propia ventana de
+gracia extendida (`REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS`,
+540s), calibrada para cubrir el overhead del propio job de auto-recuperación
+(300s de espera + 180s de ciclo + 60s de margen). Un caso real (posición 21,
+"Daejeon Citizen FC", 2026-09-15) mostró que esa calibración resolvía el
+problema equivocado: el partido en sí tardó 2.55h en resolver, no unos
+minutos -- ninguna ventana de gracia razonable puede cubrir la duración de
+un partido en vivo, y el sistema quedó detenido globalmente ~7.5h después de
+que el incidente puntual ya estaba resuelto de fondo (ver CLAUDE.md, sección
+Fase 3, para el post-mortem completo). El error de diseño: tratar
+"sin_confirmar" como si fuera el mismo patrón que "pendiente" (un lag corto
+de *procesamiento* entre una resolución ya ocurrida y que el job la marque)
+cuando en realidad es un lag de *espera al resultado del partido en sí* --
+un problema de escala de tiempo completamente distinta, sin ventana fija que
+lo resuelva.
+
+La corrección no es una ventana más larga -- es no depender del tiempo en
+absoluto. Mientras la única causa de la divergencia sea capital comprometido
+en posiciones `sin_confirmar` **actualmente conocidas** (su `cost_usd` ya
+está en `real_positions`, ya contenido al mercado puntual por el bloqueo
+per-mercado, ya contado en los topes de exposición, y con el tope de
+concurrencia de `sin_confirmar` como única red de seguridad sistémica
+restante -- ver `execution.real_executor`), esa divergencia no es una señal
+nueva de nada: ya se sabe exactamente qué la explica. `check_balance_
+reconciliation_with_grace` resta ese monto conocido (`_sin_confirmar_
+committed_cost_usd`) de la divergencia observada, sin esperar nada, y sólo
+activa el kill-switch si sobra algo sin explicar. Esto reemplaza por
+completo el rol que tenía la ventana de gracia de "sin_confirmar" -- la
+variable `REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS` se
+elimina, no se deja como alternativa sin usar. La ventana de gracia
+genérica de 240s para "pendiente" (arriba) no cambia -- ese patrón sí es
+un lag corto de procesamiento, donde esperar un rato tiene sentido.
 """
 from __future__ import annotations
 
@@ -80,61 +115,35 @@ def expected_balance_usd(session: Session) -> float:
 
 
 def _has_pending_position(session: Session) -> bool:
-    """Una posición "pendiente" o "sin_confirmar" es candidata a estar
-    resolviendo/verificándose justo ahora -- "pendiente" (shares reales
-    confirmadas, ya redimida on-chain, sólo falta que `real_resolution_job`
-    la marque "cerrada", ver CLAUDE.md, casos Santa Fe/HJK/Al Ittihad) o
-    "sin_confirmar" (2026-09-14: con la auto-recuperación de
-    `real_resolution_job::attempt_auto_recovery_of_unconfirmed_positions`,
-    una posición como AS Monaco -- capital real en una pata, la otra sin
-    confirmar -- también puede generar un excedente positivo benigno mientras
-    se verifica y se cierra sola). Es la condición que hace plausible que una
-    divergencia POSITIVA sea ese lag benigno y no un bug nuevo."""
+    """Una posición "pendiente" es candidata a estar resolviendo justo ahora
+    -- shares reales confirmadas, ya redimida on-chain, sólo falta que
+    `real_resolution_job` la marque "cerrada" (ver CLAUDE.md, casos Santa
+    Fe/HJK/Al Ittihad). Es la condición que hace plausible que una
+    divergencia POSITIVA sea ese lag corto de procesamiento y no un bug
+    nuevo -- la ventana de gracia genérica de 240s sigue aplicando sólo a
+    este patrón (ver docstring del módulo, "sin_confirmar" ya no usa
+    ventana de gracia, usa `_sin_confirmar_committed_cost_usd` en su
+    lugar)."""
     count = session.execute(
-        select(func.count())
-        .select_from(RealPosition)
-        .where(RealPosition.status.in_(("pendiente", "sin_confirmar")))
+        select(func.count()).select_from(RealPosition).where(RealPosition.status == "pendiente")
     ).scalar_one()
     return count > 0
 
 
-def _pending_position_grace_seconds(session: Session) -> float | None:
-    """Qué ventana de gracia usar, según cuál tipo de posición pendiente
-    explica un posible excedente positivo -- agregado 2026-09-14 junto con el
-    bloqueo per-mercado de "sin_confirmar" (ver `execution.real_executor` y
-    CLAUDE.md): antes, un `sin_confirmar` disparaba el halt global de
-    inmediato, así que la reconciliación nunca llegaba a correr con trading
-    real todavía activo en otros mercados -- la ventana genérica de 240s
-    nunca se puso a prueba contra ese caso. Ahora sí puede coexistir con
-    exposición real abierta en otros mercados, y un `sin_confirmar` puede
-    tardar bastante más que 240s en resolverse (hasta
-    `REAL_UNCONFIRMED_AUTO_RECOVERY_DELAY_SECONDS` desde el intento original
-    antes de que la auto-recuperación siquiera lo revise, más el ciclo del
-    job de resolución) -- una ventana de 240s dispararía una falsa alarma
-    sistemáticamente. "sin_confirmar" tiene prioridad si coexiste con
-    "pendiente" genérico (su ventana necesaria es más larga); "pendiente" sin
-    ningún "sin_confirmar" sigue usando la ventana corta ya calibrada para su
-    propio patrón (lag corto entre resolución on-chain y que el job lo
-    marque "cerrada"). Devuelve None si no hay ninguna posición candidata."""
-    has_sin_confirmar = (
-        session.execute(
-            select(func.count()).select_from(RealPosition).where(RealPosition.status == "sin_confirmar")
-        ).scalar_one()
-        > 0
-    )
-    if has_sin_confirmar:
-        return settings.real_reconciliation_grace_period_sin_confirmar_seconds
-
-    has_pendiente = (
-        session.execute(
-            select(func.count()).select_from(RealPosition).where(RealPosition.status == "pendiente")
-        ).scalar_one()
-        > 0
-    )
-    if has_pendiente:
-        return settings.real_reconciliation_grace_period_seconds
-
-    return None
+def _sin_confirmar_committed_cost_usd(session: Session) -> float:
+    """Suma de `cost_usd` de las posiciones actualmente `sin_confirmar` --
+    el monto exacto que la reconciliación ya sabe que está contado como
+    "comprometido" (`expected_balance_usd`) sin que todavía se sepa si se
+    gastó capital real de verdad (ver `real_executor._handle_unconfirmed_
+    fill`). Una divergencia POSITIVA de exactamente esa magnitud (o menos)
+    no es una señal nueva de nada -- ya se sabe qué la explica, y el
+    bloqueo per-mercado + la auto-recuperación + el tope de concurrencia de
+    `sin_confirmar` (ver `execution.real_executor`) ya la están manejando.
+    Ver docstring del módulo para por qué esto reemplaza a una ventana de
+    gracia."""
+    return session.execute(
+        select(func.coalesce(func.sum(RealPosition.cost_usd), 0.0)).where(RealPosition.status == "sin_confirmar")
+    ).scalar_one()
 
 
 def _halt_for_divergence(session: Session, actual_balance_usd: float, expected: float, divergence: float) -> None:
@@ -188,32 +197,37 @@ async def check_balance_reconciliation_with_grace(
     recheck_balance: Callable[[], Awaitable[float]] | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> bool:
-    """Igual que `check_balance_reconciliation`, pero con una tolerancia
-    ASIMÉTRICA agregada el 2026-09-12 tras confirmar 2 casos (Santa Fe,
-    Al Ittihad) del mismo patrón benigno: una posición real resuelve y se
-    redime on-chain, pero `real_resolution_job` todavía no alcanzó a marcarla
-    "cerrada" -- el balance real ya subió, `real_positions` todavía la cuenta
-    como comprometida, y la reconciliación ve un excedente que en realidad es
-    plata que ya volvió, no plata que falta.
+    """Igual que `check_balance_reconciliation`, pero con dos mecanismos de
+    tolerancia ASIMÉTRICOS -- ninguno aplica a divergencia NEGATIVA, ver
+    abajo -- que resuelven dos patrones benignos distintos, cada uno con su
+    propia lógica (no una sola ventana genérica para ambos, ver docstring
+    del módulo):
 
-    La tolerancia SÓLO aplica si se cumplen las dos condiciones a la vez:
-    divergencia POSITIVA (`actual > expected`, sobra plata) Y al menos una
-    posición en status="pendiente" o "sin_confirmar" (candidata a estar
-    resolviendo/verificándose ahora mismo). En ese caso, en vez de activar el
-    kill-switch de inmediato, se espera la ventana correspondiente
-    (`_pending_position_grace_seconds` -- más larga si hay un "sin_confirmar"
-    en curso, ver ahí) y se vuelve a chequear una sola vez con un balance
-    fresco (`recheck_balance`) y el estado actualizado de `real_positions` --
-    si para entonces el job ya cerró la posición y la divergencia
-    desapareció, no se hace nada.
+    1. **"pendiente"** (agregado 2026-09-12, confirmado con Santa Fe/Al
+       Ittihad): un lag corto de *procesamiento* -- la posición ya resolvió
+       y se redimió on-chain, sólo falta que `real_resolution_job` la marque
+       "cerrada". Se resuelve esperando `REAL_RECONCILIATION_GRACE_PERIOD_
+       SECONDS` (240s) y rechequeando una vez.
+    2. **"sin_confirmar"** (rediseñado 2026-09-15, ver docstring del
+       módulo): NO es un lag de procesamiento -- es la incertidumbre de una
+       pata que todavía no se puede confirmar, que puede coincidir con un
+       partido en curso durante horas. En vez de esperar (ninguna ventana
+       fija alcanza), se resta de la divergencia el `cost_usd` total de las
+       posiciones `sin_confirmar` conocidas (`_sin_confirmar_committed_
+       cost_usd`) -- si eso explica toda la divergencia, no hay nada nuevo
+       que señalar, sin esperar nada.
 
-    CRÍTICO -- esta tolerancia NUNCA aplica a divergencia NEGATIVA (falta
-    plata respecto a lo esperado): ese es exactamente el escenario que
-    podría ser una pérdida real o un bug nuevo (el incidente del 2026-09-08
-    fue de signo negativo), y tratarlo con el mismo margen de espera dejaría
-    correr un problema real más tiempo sin detenerlo. Divergencia negativa
-    siempre dispara el kill-switch sin esperar, sin excepción, sin importar
-    si hay posiciones pendientes."""
+    Si la divergencia (positiva) excede lo que el punto 2 explica, se cae al
+    punto 1 (si hay una posición "pendiente" que lo justifique) antes de
+    activar el kill-switch -- cubre el caso de que ambos patrones coexistan.
+
+    CRÍTICO -- ninguna de las dos tolerancias aplica a divergencia NEGATIVA
+    (falta plata respecto a lo esperado): ese es exactamente el escenario
+    que podría ser una pérdida real o un bug nuevo (el incidente del
+    2026-09-08 fue de signo negativo), y tratarlo con cualquier margen
+    dejaría correr un problema real más tiempo sin detenerlo. Divergencia
+    negativa siempre dispara el kill-switch de inmediato, sin excepción,
+    sin importar qué posiciones estén en curso."""
     threshold = settings.real_reconciliation_threshold_usd
     expected = expected_balance_usd(session)
     divergence = actual_balance_usd - expected
@@ -221,14 +235,18 @@ async def check_balance_reconciliation_with_grace(
     if abs(divergence) <= threshold:
         return False
 
-    if divergence > 0 and recheck_balance is not None:
-        grace_seconds = _pending_position_grace_seconds(session)
-        if grace_seconds is not None:
-            await sleep(grace_seconds)
+    if divergence > 0:
+        if divergence <= _sin_confirmar_committed_cost_usd(session) + threshold:
+            return False
+
+        if recheck_balance is not None and _has_pending_position(session):
+            await sleep(settings.real_reconciliation_grace_period_seconds)
             actual_balance_usd = await recheck_balance()
             expected = expected_balance_usd(session)
             divergence = actual_balance_usd - expected
             if abs(divergence) <= threshold:
+                return False
+            if divergence > 0 and divergence <= _sin_confirmar_committed_cost_usd(session) + threshold:
                 return False
 
     _halt_for_divergence(session, actual_balance_usd, expected, divergence)

@@ -1900,9 +1900,12 @@ dedicado (`sin_confirmar_concurrency_capped`) que dice explícitamente que es
 por el tope, no porque ese caso puntual sea distinto -- mismo criterio ya
 usado en `auto_recovery_capped`.
 
-**3. Ventana de gracia de reconciliación específica para sin_confirmar**:
-antes del bloqueo per-mercado, un `sin_confirmar` disparaba el halt global
-de inmediato, así que la ventana de gracia genérica de 240s
+**3. Ventana de gracia de reconciliación específica para sin_confirmar
+(SUPERADA el 2026-09-15, ver sección "Reconciliación: exclusión aritmética
+de sin_confirmar" más abajo -- se deja este párrafo como registro histórico
+de por qué se intentó primero este enfoque, no como el comportamiento
+actual)**: antes del bloqueo per-mercado, un `sin_confirmar` disparaba el
+halt global de inmediato, así que la ventana de gracia genérica de 240s
 (`REAL_RECONCILIATION_GRACE_PERIOD_SECONDS`, calibrada para "pendiente")
 nunca se ponía a prueba contra ese caso -- la reconciliación no llegaba a
 correr con trading real todavía activo en otros mercados. Ahora sí puede
@@ -1911,13 +1914,10 @@ corto: un `sin_confirmar` puede tardar hasta
 `REAL_UNCONFIRMED_AUTO_RECOVERY_DELAY_SECONDS` (300s) desde el intento
 original antes de que la auto-recuperación siquiera lo revise, más hasta
 `RESOLUTION_CHECK_INTERVAL_SECONDS` (180s) hasta que el job periódico corra
-ese ciclo. Nueva variable `REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS`
-(default 540s = 300 + 180 + 60s de margen, mismo criterio de buffer ya usado
-entre 240 y 180). `reconciliation._pending_position_grace_seconds` decide
-cuál ventana usar: si coexiste un `sin_confirmar` con un `pendiente`
-genérico, se usa la más larga (la de sin_confirmar). La asimetría existente
-(sólo divergencia POSITIVA recibe cualquier margen; negativa dispara
-siempre de inmediato, sin importar el tipo de posición pendiente) no cambió.
+ese ciclo. Se agregó `REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS`
+(540s = 300 + 180 + 60s de margen) -- **este enfoque resultó estar mal
+calibrado contra la causa real y fue retirado un día después**, ver la
+sección de abajo.
 
 **4. Dashboard**: `RealTradingStatus` (`dashboard/snapshot.py`) gana un
 campo `locked_markets` (lista de `(market_id, question)`), independiente de
@@ -1931,21 +1931,98 @@ mercados y un contador para el resto si hay más, para no saturar el panel.
 **Tests**: `test_second_market_keeps_operating_while_first_is_locked_by_sin_confirmar`,
 `test_concurrency_cap_reached_forces_global_halt`,
 `test_unconfirmed_fill_after_exhausting_retries_marks_sin_confirmar_and_locks_only_that_market`
-(en `test_execution_real_executor.py`);
-`test_positive_divergence_with_sin_confirmar_position_self_heals_within_grace_window`
-(actualizado a la ventana específica),
-`test_sin_confirmar_grace_window_takes_priority_over_generic_pending_window`,
-`test_negative_divergence_halts_immediately_regardless_of_pending_position_type`
-(en `test_execution_reconciliation.py`);
-`test_real_trading_status_lists_locked_markets_even_when_active`,
+(en `test_execution_real_executor.py`); `test_real_trading_status_lists_locked_markets_even_when_active`,
 `test_real_trading_status_no_locked_markets_when_none_sin_confirmar` (en
 `test_dashboard_snapshot.py`); `test_locked_markets_shown_even_when_state_is_activo`,
 `test_no_locked_markets_row_when_none_are_blocked`,
 `test_many_locked_markets_shows_count_and_truncates_detail` (en
-`test_dashboard_render.py`).
+`test_dashboard_render.py`). Los tests de reconciliación de este cambio
+(`test_positive_divergence_with_sin_confirmar_position_self_heals_within_grace_window`,
+`test_sin_confirmar_grace_window_takes_priority_over_generic_pending_window`)
+se reemplazaron el 2026-09-15 -- ver la sección de abajo.
 
-**Variables nuevas en `.env`**: `REAL_MAX_CONCURRENT_SIN_CONFIRMAR` (2),
-`REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS` (540.0).
+**Variables nuevas en `.env`**: `REAL_MAX_CONCURRENT_SIN_CONFIRMAR` (2).
+`REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS` se agregó acá y se
+eliminó al día siguiente -- ver sección de abajo.
+
+### Reconciliación: exclusión aritmética de sin_confirmar, no ventana de gracia (2026-09-15)
+
+**Confirmado en producción, un día después del punto 3 de arriba, que la
+ventana de gracia extendida no era la solución correcta**: la 11na
+activación (`REAL_TRADING_ENABLED` seguía activo desde el día anterior, sin
+volver a apagarse) ejecutó una posición real (id 21, *"Will Daejeon Citizen
+FC win on 2026-09-15?"*) cuya pata YES quedó `sin_confirmar` -- correctamente
+bloqueada sólo en ese mercado por el cambio del día anterior, sin halt
+global inmediato. Pero 650.6s después (justo pasada la ventana de gracia de
+540s), la reconciliación SÍ disparó un halt GLOBAL: `check_balance_
+reconciliation_with_grace` esperó los 540s, rechequeó, el partido **seguía
+en curso**, la divergencia positiva (+$5.00, exactamente el `cost_usd` de la
+posición `sin_confirmar`) persistía, y llamó a `kill_switch.halt()` --
+exactamente el riesgo que el análisis de diseño original había identificado
+y quedado sin resolver: el bloqueo per-mercado nunca tocó
+`reconciliation.py`, así que ese módulo seguía teniendo su propia vía,
+independiente, hacia un halt global para la misma causa.
+
+**Por qué ninguna ventana de gracia más larga podía funcionar**: el partido
+tardó **9197.8s (2.55h)** en resolver -- 17 veces la ventana de 540s. La
+auto-recuperación (que no depende de `is_halted()`) siguió corriendo en
+paralelo y sí backfilleó la posición correctamente a las 2.55h (`realized_
+pnl=$0.00`, huella conocida verificada), pero el sistema quedó detenido
+**globalmente durante ~10h11m en total** (de las cuales ~7.5h fueron
+estrictamente innecesarias: desde que la posición se resolvió y backfilleó
+hasta que se detectó y se reactivó a mano) porque el tope de
+auto-recuperaciones en ventana móvil (`REAL_AUTO_RECOVERY_MAX_PER_WINDOW=3`)
+ya se había alcanzado con esta 4ta recuperación, así que ni siquiera el
+auto-clear pudo levantar el flag solo. Cualquier ventana de gracia fija
+--540s, 1h, 3h-- iba a fallar contra el próximo partido que tardara más:
+"cuánto tarda un partido en resolver" no tiene un techo razonable que
+calibrar, a diferencia del lag de *procesamiento* de "pendiente" (segundos a
+minutos, ese sí acotable).
+
+**Fix -- exclusión aritmética en vez de espera** (`execution/reconciliation.py`):
+se retira `REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS` por
+completo (no se deja como alternativa sin usar) y se reemplaza por
+`_sin_confirmar_committed_cost_usd(session)` -- la suma de `cost_usd` de las
+posiciones `sin_confirmar` actualmente abiertas. `check_balance_
+reconciliation_with_grace` resta ese monto de una divergencia POSITIVA
+**sin esperar nada**: si explica toda la divergencia, no hay señal nueva que
+dar (ya se sabe exactamente qué la causa, y el bloqueo per-mercado + la
+auto-recuperación + el tope de concurrencia de `sin_confirmar` -- ver
+sección de arriba -- ya la están manejando activamente); si sobra algo sin
+explicar, reconciliación sigue cumpliendo su rol original y dispara el halt
+global de inmediato (sin ventana, tampoco -- no hay ninguna razón para
+esperar ante algo que no se puede atribuir a una causa ya conocida). Si
+además coexiste una posición `pendiente` (patrón distinto, de
+procesamiento corto), el excedente sin explicar por `sin_confirmar` sigue
+recibiendo la ventana genérica de 240s antes de decidir -- ese mecanismo no
+cambió. La asimetría (divergencia NEGATIVA nunca recibe ningún margen, sea
+cual sea la causa) tampoco cambió.
+
+**Por qué no se intentó una ventana todavía más larga, ni una calibrada
+dinámicamente por partido**: no hay forma de saber de antemano cuánto va a
+tardar un partido en particular en resolver (podría ser 10 minutos o 4
+horas), así que cualquier ventana fija sigue siendo una apuesta que puede
+fallar contra el próximo caso -- el patrón exacto que motivó descartar la
+primera ventana. La exclusión aritmética no depende de una duración
+estimada en absoluto: mientras la posición siga `sin_confirmar`, su costo
+sigue restándose de la divergencia sin importar cuánto tiempo pase.
+
+**Tests** (`test_execution_reconciliation.py`, reemplazan los del punto 3
+de arriba): `test_positive_divergence_fully_explained_by_sin_confirmar_does_not_halt`
+(la divergencia coincide con el `cost_usd` de la sin_confirmar -- no dispara,
+y `sleep` nunca se llama), `test_positive_divergence_exceeding_sin_confirmar_cost_still_halts`
+(divergencia por encima de lo explicado -- sigue disparando),
+`test_positive_divergence_exceeding_sin_confirmar_falls_back_to_pendiente_grace`
+(sin_confirmar + pendiente coexistiendo -- el excedente no explicado por
+sin_confirmar cae a la gracia de 240s de pendiente, sin cambios ahí),
+`test_negative_divergence_with_sin_confirmar_position_halts_immediately`,
+`test_negative_divergence_halts_immediately_regardless_of_pending_position_type`
+(la asimetría se mantiene intacta).
+
+**Variable eliminada de `.env`**: `REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS`
+(agregada el 2026-09-14, retirada el 2026-09-15 -- ver arriba).
+
+Implementado en la rama `execution/reconciliation-exclude-sin-confirmar-divergence`.
 
 ### Pendiente para la próxima activación
 
@@ -1964,11 +2041,16 @@ mercados y un contador para el resto si hay más, para no saturar el panel.
   funciona como se diseñó la próxima vez que aparezca un caso con la huella
   conocida -- hasta ahora sólo está probada con tests, no contra un
   incidente real.
-- Confirmar en producción que el bloqueo per-mercado de `sin_confirmar` (ver
-  sección arriba, ya mergeado y desplegado el 2026-09-14) deja el resto del
-  sistema operable la próxima vez que aparezca un `sin_confirmar` nuevo
-  mientras SC Braga (u otro incidente) sigue sin resolver -- todavía sólo
-  probado con tests, no contra un caso real en producción.
+- **Confirmado parcialmente el 2026-09-15 (posición 21, Daejeon Citizen
+  FC)**: el bloqueo per-mercado en sí funcionó -- `_handle_unconfirmed_fill`
+  no disparó halt global, sólo bloqueó ese mercado puntual. Pero la
+  reconciliación SÍ terminó globalizando el mismo incidente por una vía
+  separada (ver "Reconciliación: exclusión aritmética de sin_confirmar"
+  abajo) -- fix implementado en la rama `execution/reconciliation-exclude-
+  sin-confirmar-divergence`, pendiente de revisión y merge a master. Sigue
+  faltando confirmar en producción el escenario completo (dos
+  `sin_confirmar` en mercados distintos, ambos operables en paralelo, sin
+  que la reconciliación interfiera) con el fix ya desplegado.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
