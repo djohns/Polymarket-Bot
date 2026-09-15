@@ -186,27 +186,17 @@ class Settings:
     # el kill-switch GLOBAL, con un mensaje explícito de que es por el tope de
     # concurrencia, no porque ese caso puntual sea distinto de los demás.
     real_max_concurrent_sin_confirmar: int = _int_env("REAL_MAX_CONCURRENT_SIN_CONFIRMAR", 2)
-    # Ventana de gracia de reconciliación específica para cuando la posición
-    # pendiente en cuestión es "sin_confirmar" (no "pendiente" genérico, que
-    # sigue usando REAL_RECONCILIATION_GRACE_PERIOD_SECONDS=240s). Antes del
-    # bloqueo per-mercado, un `sin_confirmar` ya disparaba el halt global de
-    # inmediato, así que una ventana de gracia mal calibrada no importaba --
-    # la reconciliación nunca llegaba a correr con el trading real todavía
-    # activo en otros mercados. Ahora sí puede coexistir con exposición real
-    # abierta en otros lados, así que 240s (calibrado para el lag corto de
-    # "pendiente", resolución on-chain ya ocurrida, sólo falta que el job la
-    # marque "cerrada") es demasiado corto: un `sin_confirmar` puede tardar
-    # hasta `REAL_UNCONFIRMED_AUTO_RECOVERY_DELAY_SECONDS` (300s) desde el
-    # intento original antes de que la auto-recuperación siquiera lo revise,
-    # más hasta `RESOLUTION_CHECK_INTERVAL_SECONDS` (180s) hasta que el job
-    # periódico corra ese ciclo. Default 540s = 300 + 180 + 60s de margen --
-    # mismo criterio de margen ya usado entre esos dos números (240 vs 180 =
-    # 60s de buffer, ver arriba). Si coexisten una posición "sin_confirmar" y
-    # una "pendiente", se usa esta ventana más larga (sin_confirmar tiene
-    # prioridad) -- ver `reconciliation._pending_position_grace_seconds`.
-    real_reconciliation_grace_period_sin_confirmar_seconds: float = _float_env(
-        "REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS", 540.0
-    )
+    # NO hay una ventana de gracia de reconciliación específica para
+    # "sin_confirmar" -- se probó una (2026-09-14, 540s, ya retirada) y un
+    # caso real (posición 21, "Daejeon Citizen FC", 2026-09-15) mostró que
+    # el enfoque estaba mal de raíz: el partido tardó 2.55h en resolver, no
+    # unos minutos, y ninguna ventana fija razonable cubre eso. En vez de
+    # esperar, `reconciliation.check_balance_reconciliation_with_grace`
+    # resta de la divergencia el `cost_usd` conocido de las posiciones
+    # `sin_confirmar` actuales (`_sin_confirmar_committed_cost_usd`) -- si
+    # eso explica toda la divergencia, no hace falta esperar nada. Ver
+    # CLAUDE.md, sección Fase 3, para el post-mortem completo y por qué no
+    # se debe volver a proponer una ventana más larga para esto.
 
 
 settings = Settings()

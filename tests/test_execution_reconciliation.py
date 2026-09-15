@@ -198,48 +198,115 @@ def _sin_confirmar_position(**overrides) -> RealPosition:
     return RealPosition(**defaults)
 
 
-def test_positive_divergence_with_sin_confirmar_position_self_heals_within_grace_window(tmp_path):
-    """Extensión del 2026-09-14: "sin_confirmar" recibe la misma tolerancia
-    positiva que "pendiente" -- una posición como AS Monaco FC (capital real
-    en una pata, la otra sin confirmar) también puede generar un excedente
-    positivo benigno mientras la auto-recuperación la verifica y cierra.
-
-    Usa su PROPIA ventana de gracia, más larga que la genérica de "pendiente"
-    (`REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS`, no
-    `REAL_RECONCILIATION_GRACE_PERIOD_SECONDS`) -- ver
-    `reconciliation._pending_position_grace_seconds` y CLAUDE.md: con el
-    bloqueo per-mercado, un `sin_confirmar` ya puede coexistir con trading
-    real activo en otros mercados, y su propio proceso de auto-recuperación
-    tarda bastante más que el lag corto de "pendiente"."""
+def test_positive_divergence_fully_explained_by_sin_confirmar_does_not_halt(tmp_path):
+    """Rediseño del 2026-09-15 (post-mortem posición 21, "Daejeon Citizen
+    FC"): una divergencia positiva cuyo monto coincide con el `cost_usd` de
+    una posición `sin_confirmar` conocida ya está explicada -- no hace falta
+    esperar nada (a diferencia del enfoque anterior de ventana de gracia,
+    ver CLAUDE.md), la resta aritmética decide de inmediato. `sleep` nunca
+    debería llamarse."""
     session_factory = _session_factory()
     flag = tmp_path / "HALT"
     with _override(
         real_capital_base_usd=20.0,
         real_reconciliation_threshold_usd=0.50,
         real_reconciliation_grace_period_seconds=240.0,
-        real_reconciliation_grace_period_sin_confirmar_seconds=500.0,
         real_kill_switch_flag_path=str(flag),
         real_balance_checkpoint_usd=None,
         real_balance_checkpoint_at=None,
     ):
         with session_factory() as session:
-            pos = _sin_confirmar_position()
-            session.add(pos)
+            session.add(_sin_confirmar_position(cost_usd=5.0))
             session.commit()
 
             sleep_calls: list[float] = []
 
             async def fake_sleep(seconds: float) -> None:
                 sleep_calls.append(seconds)
-                pos.status = "cerrada"
-                pos.realized_pnl = 0.0
+
+            async def recheck_balance() -> float:
+                raise AssertionError("no debería recheckear -- la divergencia ya está explicada")
+
+            # expected = 20 - 5 (comprometido de la sin_confirmar) = 15; actual=20 -> diff=+5,
+            # exactamente el cost_usd de la sin_confirmar -> explicada, no dispara.
+            triggered = asyncio.run(
+                reconciliation.check_balance_reconciliation_with_grace(
+                    session, 20.0, recheck_balance=recheck_balance, sleep=fake_sleep
+                )
+            )
+        assert triggered is False
+        assert not flag.exists()
+        assert sleep_calls == []  # nunca esperó -- decisión aritmética inmediata
+
+
+def test_positive_divergence_exceeding_sin_confirmar_cost_still_halts(tmp_path):
+    """Si la divergencia excede lo que las `sin_confirmar` conocidas
+    explican (ej. $7 de más pero sólo $5 corresponden a una sin_confirmar),
+    sigue siendo una señal de algo no explicado -- reconciliación debe
+    seguir cumpliendo ese rol, sin esperar (no hay ninguna "pendiente" acá
+    que justifique la gracia genérica)."""
+    session_factory = _session_factory()
+    flag = tmp_path / "HALT"
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_reconciliation_grace_period_seconds=240.0,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
+        with session_factory() as session:
+            session.add(_sin_confirmar_position(cost_usd=5.0))
+            session.commit()
+
+            async def recheck_balance() -> float:
+                raise AssertionError("no debería recheckear -- no hay 'pendiente' que justifique la gracia")
+
+            # expected = 20 - 5 = 15; actual=22 -> diff=+7, sólo $5 explicados por sin_confirmar
+            # -> quedan $2 sin explicar, por encima del umbral -> dispara.
+            triggered = asyncio.run(
+                reconciliation.check_balance_reconciliation_with_grace(
+                    session, 22.0, recheck_balance=recheck_balance, sleep=None
+                )
+            )
+        assert triggered is True
+        assert kill_switch.is_halted(str(flag)) is True
+
+
+def test_positive_divergence_exceeding_sin_confirmar_falls_back_to_pendiente_grace(tmp_path):
+    """Si además de una `sin_confirmar` (que explica parte de la divergencia)
+    coexiste una `pendiente`, el excedente sin explicar sigue recibiendo la
+    ventana genérica de 240s antes de decidir -- ese patrón (lag corto de
+    procesamiento) no cambió."""
+    session_factory = _session_factory()
+    flag = tmp_path / "HALT"
+    with _override(
+        real_capital_base_usd=20.0,
+        real_reconciliation_threshold_usd=0.50,
+        real_reconciliation_grace_period_seconds=240.0,
+        real_kill_switch_flag_path=str(flag),
+        real_balance_checkpoint_usd=None,
+        real_balance_checkpoint_at=None,
+    ):
+        with session_factory() as session:
+            pending = _pending_position(cost_usd=5.0)
+            session.add(pending)
+            session.add(_sin_confirmar_position(cost_usd=5.0))
+            session.commit()
+
+            sleep_calls: list[float] = []
+
+            async def fake_sleep(seconds: float) -> None:
+                sleep_calls.append(seconds)
+                pending.status = "cerrada"
+                pending.realized_pnl = 0.0
                 session.commit()
 
             async def recheck_balance() -> float:
-                return 20.0  # el balance no cambia -- "sin_confirmar" nunca gastó capital real
+                return 20.0  # sólo queda comprometido el cost_usd de la sin_confirmar (5.0)
 
-            # expected antes: 20 - 0 (comprometido, cost_usd=0 para sin_confirmar) = 20;
-            # actual=20.6 -> diff=+0.6, supera el umbral de 0.50 -> dispara la gracia.
+            # expected antes: 20 - (5 pendiente + 5 sin_confirmar) = 10; actual=20.6 -> diff=+10.6,
+            # sin_confirmar explica 5.0 -> quedan 5.6 sin explicar -> cae a la gracia de "pendiente".
             triggered = asyncio.run(
                 reconciliation.check_balance_reconciliation_with_grace(
                     session, 20.6, recheck_balance=recheck_balance, sleep=fake_sleep
@@ -247,52 +314,13 @@ def test_positive_divergence_with_sin_confirmar_position_self_heals_within_grace
             )
         assert triggered is False
         assert not flag.exists()
-        assert sleep_calls == [500.0]  # la ventana específica de sin_confirmar, no los 240s genéricos
-
-
-def test_sin_confirmar_grace_window_takes_priority_over_generic_pending_window(tmp_path):
-    """Si coexisten una posición "sin_confirmar" y una "pendiente" a la vez,
-    se usa la ventana MÁS LARGA (la de sin_confirmar) -- no la genérica de
-    240s, que sería demasiado corta para el proceso de auto-recuperación de
-    sin_confirmar."""
-    session_factory = _session_factory()
-    flag = tmp_path / "HALT"
-    with _override(
-        real_capital_base_usd=20.0,
-        real_reconciliation_threshold_usd=0.50,
-        real_reconciliation_grace_period_seconds=240.0,
-        real_reconciliation_grace_period_sin_confirmar_seconds=500.0,
-        real_kill_switch_flag_path=str(flag),
-        real_balance_checkpoint_usd=None,
-        real_balance_checkpoint_at=None,
-    ):
-        with session_factory() as session:
-            session.add(_pending_position())
-            session.add(_sin_confirmar_position())
-            session.commit()
-
-            sleep_calls: list[float] = []
-
-            async def fake_sleep(seconds: float) -> None:
-                sleep_calls.append(seconds)
-
-            async def recheck_balance() -> float:
-                return 20.0
-
-            triggered = asyncio.run(
-                reconciliation.check_balance_reconciliation_with_grace(
-                    session, 20.6, recheck_balance=recheck_balance, sleep=fake_sleep
-                )
-            )
-        assert triggered is True  # nada cambió durante la espera -- sigue divergiendo
-        assert sleep_calls == [500.0]
+        assert sleep_calls == [240.0]
 
 
 def test_negative_divergence_with_sin_confirmar_position_halts_immediately(tmp_path):
-    """CRÍTICO (pedido explícito del usuario): la asimetría sigue aplicando
-    para "sin_confirmar" -- una divergencia NEGATIVA nunca recibe el margen
-    de espera, sin importar si hay una posición "sin_confirmar" en curso.
-    Podría ser una pérdida real o un bug nuevo, mismo criterio que "pendiente"."""
+    """CRÍTICO (pedido explícito del usuario): la exclusión de "sin_confirmar"
+    NUNCA aplica a divergencia NEGATIVA -- podría ser una pérdida real o un
+    bug nuevo, mismo criterio que "pendiente"."""
     session_factory = _session_factory()
     flag = tmp_path / "HALT"
     with _override(
@@ -304,7 +332,7 @@ def test_negative_divergence_with_sin_confirmar_position_halts_immediately(tmp_p
         real_balance_checkpoint_at=None,
     ):
         with session_factory() as session:
-            session.add(_sin_confirmar_position())
+            session.add(_sin_confirmar_position(cost_usd=5.0))
             session.commit()
 
             sleep_calls: list[float] = []
@@ -315,10 +343,11 @@ def test_negative_divergence_with_sin_confirmar_position_halts_immediately(tmp_p
             async def recheck_balance() -> float:
                 raise AssertionError("no debería recheckear una divergencia negativa")
 
-            # expected = 20 - 0 = 20; actual=19 -> diff=-1, negativa
+            # expected = 20 - 5 = 15; actual=10 -> diff=-5, negativa -- aunque el monto
+            # "coincida" con el cost_usd de la sin_confirmar, la exclusión no aplica a negativas.
             triggered = asyncio.run(
                 reconciliation.check_balance_reconciliation_with_grace(
-                    session, 19.0, recheck_balance=recheck_balance, sleep=fake_sleep
+                    session, 10.0, recheck_balance=recheck_balance, sleep=fake_sleep
                 )
             )
         assert triggered is True
@@ -329,15 +358,14 @@ def test_negative_divergence_with_sin_confirmar_position_halts_immediately(tmp_p
 def test_negative_divergence_halts_immediately_regardless_of_pending_position_type(tmp_path):
     """CRÍTICO (pedido explícito): la asimetría no distingue "pendiente" de
     "sin_confirmar" -- con AMBOS tipos coexistiendo, una divergencia NEGATIVA
-    sigue disparando el kill-switch de inmediato, sin esperar ninguna de las
-    dos ventanas de gracia."""
+    sigue disparando el kill-switch de inmediato, sin esperar ninguna
+    tolerancia."""
     session_factory = _session_factory()
     flag = tmp_path / "HALT"
     with _override(
         real_capital_base_usd=20.0,
         real_reconciliation_threshold_usd=0.50,
         real_reconciliation_grace_period_seconds=240.0,
-        real_reconciliation_grace_period_sin_confirmar_seconds=500.0,
         real_kill_switch_flag_path=str(flag),
         real_balance_checkpoint_usd=None,
         real_balance_checkpoint_at=None,
