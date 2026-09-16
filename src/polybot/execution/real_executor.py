@@ -107,10 +107,13 @@ muy sesgado hacia YES), pero al enviar NO el exchange rechazó la orden de
 plano -- `"invalid amount for a marketable BUY order ($0.52), min size: 1"`.
 El presupuesto de NO (dimensionado por las shares reales de YES contra un
 book de NO muy barato, ~$0.11) cayó bajo el mínimo de orden del exchange.
-A diferencia de Al Ittihad/Boca Juniors (fallas de red aleatorias), esto es
-**determinístico**: va a volver a pasar cada vez que el mercado esté lo
-bastante sesgado como para que el lado barato, al tamaño que le toca cubrir,
-no llegue al mínimo. Fix: `_execute_fill` valida esto **antes de tocar
+Este es **determinístico**: va a volver a pasar cada vez que el mercado esté
+lo bastante sesgado como para que el lado barato, al tamaño que le toca
+cubrir, no llegue al mínimo (a diferencia de Al Ittihad/Boca Juniors,
+categorizados originalmente como "fallas de red aleatorias" -- corregido el
+2026-09-16, ver CLAUDE.md: esa categorización nunca tuvo traceback real que
+la respaldara, y ambos presupuestos estaban en el mismo rango bajo $1 que
+este incidente). Fix: `_execute_fill` valida esto **antes de tocar
 YES** -- camina el book de NO en vivo con el tamaño ESTIMADO de YES
 (`fill.shares`, la única referencia disponible en este punto) y, si el
 presupuesto resultante cae bajo `REAL_MIN_ORDER_VALUE_USD`, aborta el trade
@@ -118,6 +121,23 @@ completo sin gastar nada (mismo nivel que "no hay fill rentable"). No
 reemplaza `_handle_leg_imbalance` -- sigue siendo la red de seguridad para
 los casos que pasan esta validación previa pero fallan por otra razón en el
 envío real (ver docstring de esa función).
+
+**Gap en esa prevención, encontrado en la posición 23 "Deportivo Toluca FC"
+(2026-09-16)**: la validación de arriba corre UNA sola vez, antes de tocar
+YES, contra el tamaño ESTIMADO (`fill.shares`). Si el fill REAL de YES
+difiere mucho de esa estimación -- acá, 3.641 shares reales contra 7.6923
+estimadas, porque el precio de YES saltó de ~0.37 implícito a 0.78 real en
+vivo (un mercado deportivo moviéndose durante el partido, ej. un gol) -- el
+presupuesto de NO recalculado para el tamaño REAL puede caer bajo el mínimo
+aunque la validación pre-YES haya pasado para la estimación. Sin una segunda
+validación, el único aviso era el mismo 400 determinístico del exchange en
+el envío real, indistinguible en el log de una falla de red genuina (mismo
+`event_type="order_send_failed"` que Al Ittihad/Boca Juniors). Fix:
+`_execute_fill` revalida el presupuesto recalculado de NO contra
+`REAL_MIN_ORDER_VALUE_USD` justo antes de intentar el envío HTTP -- si cae
+bajo el mínimo, aborta por `_handle_leg_imbalance` con un evento y motivo
+explícitos (`no_leg_infeasible_post_fill`), distintos de una falla de envío
+HTTP genérica, para no perder la distinción que este incidente reveló.
 
 **Bloqueo per-mercado de "sin_confirmar" (2026-09-14, ver CLAUDE.md sección
 Fase 3, análisis de viabilidad previo a este cambio)**: un `sin_confirmar`
@@ -663,6 +683,61 @@ class RealExecutionEngine:
                 },
             )
 
+        # Revalidación de feasibility POST-fill real de YES (2026-09-16,
+        # incidente posición 23 "Deportivo Toluca FC" -- ver docstring del
+        # módulo y CLAUDE.md): la validación de la Décima activación (arriba,
+        # `estimated_no_budget`) sólo corre UNA vez, antes de tocar YES,
+        # contra el tamaño ESTIMADO (`fill.shares`). Si el fill real de YES
+        # difiere mucho de esa estimación -- acá, 3.641 shares reales contra
+        # 7.6923 estimadas, porque el precio de YES saltó de ~0.37 implícito
+        # a 0.78 real en vivo -- el presupuesto de NO recalculado para el
+        # tamaño REAL puede caer bajo el mínimo aunque la validación pre-YES
+        # haya pasado para el tamaño estimado. Sin este chequeo, el único
+        # aviso era el 400 determinístico del exchange en el envío real
+        # (`"invalid amount... min size: 1"`), indistinguible en el log de
+        # una falla de red genuina -- se aborta acá, ANTES del intento HTTP,
+        # con el motivo explícito para no perder esa distinción.
+        if no_budget < settings.real_min_order_value_usd:
+            logger.warning(
+                "Arb infeasible post-fill en %s: presupuesto recalculado de NO ($%.4f para %.4f shares "
+                "reales, estimado pre-trade %.4f) cae bajo el mínimo de orden del exchange ($%.2f) -- "
+                "el precio se movió entre la estimación y el fill real de YES, se aborta antes de "
+                "enviar la orden NO",
+                market.question[:60],
+                no_budget,
+                yes_shares_real,
+                fill.shares,
+                settings.real_min_order_value_usd,
+            )
+            log_event(
+                session,
+                "no_leg_infeasible_post_fill",
+                "critical",
+                f"Presupuesto de NO recalculado tras el fill real de YES (${no_budget:.4f} para "
+                f"{yes_shares_real:.4f} shares reales, estimado {fill.shares:.4f}) cae bajo el mínimo "
+                f"de orden del exchange (${settings.real_min_order_value_usd:.2f}) -- infeasible "
+                "post-fill por movimiento de precio, no se intenta enviar la orden NO",
+                market_id=market.condition_id,
+                real_position_id=position.id,
+                detail={
+                    "no_budget_usd": no_budget,
+                    "yes_shares_real": yes_shares_real,
+                    "estimated_yes_shares": fill.shares,
+                    "min_order_value_usd": settings.real_min_order_value_usd,
+                },
+            )
+            self._handle_leg_imbalance(
+                session,
+                position,
+                no_resp=None,
+                reason=(
+                    "Infeasible post-fill por movimiento de precio: el presupuesto de NO recalculado "
+                    "tras el fill real de YES cayó bajo el mínimo de orden del exchange antes de "
+                    "intentar el envío (no es una falla de envío HTTP)."
+                ),
+            )
+            return
+
         try:
             no_resp = _place_market_buy(self._client, market.no_token_id, no_budget)
         except Exception:  # noqa: BLE001 -- capa de I/O con un SDK externo, se maneja explícitamente abajo
@@ -766,19 +841,31 @@ class RealExecutionEngine:
             real_position_id=position.id,
         )
 
-    def _handle_leg_imbalance(self, session: Session, position: RealPosition, no_resp: dict | None) -> None:
+    def _handle_leg_imbalance(
+        self, session: Session, position: RealPosition, no_resp: dict | None, *, reason: str | None = None
+    ) -> None:
         """Marca la posición desbalanceada y detiene todo trading real de inmediato --
-        no se intenta deshacer ni recuperar automáticamente (ver CLAUDE.md)."""
+        no se intenta deshacer ni recuperar automáticamente (ver CLAUDE.md).
+
+        `reason` (2026-09-16, incidente posición 23 "Deportivo Toluca FC"):
+        motivo explícito opcional para distinguir POR QUÉ la pata NO nunca
+        se confirmó -- por defecto (sin `reason`) sigue siendo el caso
+        genérico de falla de envío HTTP (Al Ittihad/Boca Juniors); pasar un
+        `reason` explícito cuando el llamador ya sabe la causa (ej.
+        infeasible post-fill por movimiento de precio, ver
+        `no_leg_infeasible_post_fill`) para no perder esa distinción en
+        `notes`/el motivo del kill-switch."""
         position.status = "pendiente"
         position.no_shares = 0.0  # la pata NO nunca se confirmó -- no hay capital real ahí
         # cost_usd ya quedó en el costo real de sólo YES (fee incluido) desde que se
         # confirmó esa pata -- no hace falta recalcularlo acá.
         position.fee_paid = 0.0
-        position.notes = "Leg imbalance: pata YES llenó, pata NO no confirmó."
+        position.notes = reason or "Leg imbalance: pata YES llenó, pata NO no confirmó."
         session.commit()
 
         kill_switch.halt(
-            f"leg imbalance real en mercado {position.market_id} -- pata YES llenó, pata NO no confirmó",
+            f"leg imbalance real en mercado {position.market_id} -- "
+            f"{reason or 'pata YES llenó, pata NO no confirmó'}",
             session=session,
         )
 

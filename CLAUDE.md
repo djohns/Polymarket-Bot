@@ -1387,6 +1387,28 @@ código:
   lanzó una excepción. Resolvió sola con YES ganador
   (`realized_pnl=+$0.7010`).
 
+**CORRECCIÓN (2026-09-16, ver sección "Bug 9" más abajo) -- la categorización
+de estos dos incidentes como "falla de red/cliente genuina" nunca tuvo
+evidencia real que la respaldara**: el fix que persiste el traceback de la
+excepción en `detail` (`exc_info` -> `event_log`) recién se agregó el
+2026-09-12, **un día después** de estos dos incidentes -- sus eventos
+`order_send_failed` quedaron con `detail=null`, sin ningún registro del
+error real. La conclusión "falla de red/cliente al conectar con el
+exchange, no un rechazo de la orden" se escribió sin poder verificarla.
+Dato que sí quedó registrado en ambos casos: los presupuestos de NO que
+fallaron fueron **$0.44 (Al Ittihad) y $0.93 (Boca Juniors)** -- ambos por
+debajo de `REAL_MIN_ORDER_VALUE_USD` ($1.00), el mismo rango exacto que
+Getafe/Deportivo (Décima activación, $0.52) y Toluca FC (Bug 9, $0.76), que
+sí tuvieron traceback capturado y **ambos resultaron ser el mismo rechazo
+determinístico** (`PolyApiException 400: "invalid amount... min size: 1"`),
+no una falla de red. **No hay forma de confirmar con certeza** qué pasó en
+Al Ittihad/Boca Juniors sin ese traceback (ya es tarde, esas órdenes no se
+pueden re-consultar) -- pero es plausible, dado el rango de presupuesto
+idéntico, que también hayan sido el mismo rechazo por mínimo de orden, no
+2 fallas de red distintas como se documentó originalmente. El registro
+original arriba se deja tal cual (no se reescribe la conclusión de esa
+sesión), sólo se marca acá como no verificada.
+
 ### Auditoría de estado (2026-09-12) — 11 posiciones reales, P&L +$1.13, 7 kill-switch en total
 
 Auditoría de solo lectura sobre las 11 posiciones reales hasta la fecha:
@@ -2022,7 +2044,85 @@ sin_confirmar cae a la gracia de 240s de pendiente, sin cambios ahí),
 **Variable eliminada de `.env`**: `REAL_RECONCILIATION_GRACE_PERIOD_SIN_CONFIRMAR_SECONDS`
 (agregada el 2026-09-14, retirada el 2026-09-15 -- ver arriba).
 
-Implementado en la rama `execution/reconciliation-exclude-sin-confirmar-divergence`.
+Revisado, aprobado, mergeado a `master` (commit `4940ac4`) y desplegado en la
+VPS el 2026-09-15 -- 139/139 tests en verde. **Confirmado contra un caso real
+un día después** (posición 22, "Will CA Boca Juniors win on 2026-09-15?",
+2026-09-16): quedó `sin_confirmar` con `cost_usd=$5.00` y estuvo ~47 minutos
+(≈9 ciclos de reconciliación) sin generar ningún `reconciliation_divergence`
+ni `kill_switch_triggered` mientras el partido seguía en curso -- exactamente
+el comportamiento diseñado, contra el escenario real que motivó el fix
+(comparar con el caso Daejeon, que a los 650.6s ya tenía un halt global).
+
+### Bug 9 (2026-09-16) — gap en la prevención de leg imbalance por presupuesto infeasible: la validación sólo corría contra el tamaño ESTIMADO de YES, no el real
+
+**Contexto**: con el fix de reconciliación de arriba ya en producción y el
+kill-switch recién levantado tras el incidente de Daejeon, la siguiente
+ejecución real (posición 23, *"Will Deportivo Toluca FC win on
+2026-09-04?"*) terminó en un **leg imbalance real**: pata YES llenó
+(3.641022 shares @ $0.78, `cost_usd=$2.871237` -- verificado exacto contra
+`data-api.polymarket.com/activity`, un único trade on-chain en el token
+YES, cero en NO), pero el envío de la pata NO fue rechazado por el exchange.
+
+**Investigación de solo lectura, antes de tocar nada**: el traceback
+completo (persistido en `detail` desde el fix del 2026-09-12) mostró que
+**no fue una falla de red** -- fue el mismo rechazo determinístico ya visto
+en Getafe/Deportivo (Décima activación): `PolyApiException[status_code=400,
+error_message={'error': 'invalid amount for a marketable BUY order
+($0.76), min size: 1'}]`. Causa raíz: la validación de feasibility de la
+Décima activación corre **una sola vez, antes de tocar YES, contra el
+tamaño ESTIMADO** (`fill.shares=7.6923`) y pasó (presupuesto estimado de NO
+~$1.6, por encima del mínimo). Pero el fill REAL de YES llegó a **3.641
+shares -- 47% del estimado** (el precio de YES saltó de ~0.37 implícito en
+la estimación a 0.78 real, típico de un mercado deportivo moviéndose en
+vivo -- probablemente un gol). El presupuesto de NO se recalcula para el
+tamaño real confirmado (como corresponde desde el rediseño de sizing de
+2026-09-11) pero **nunca se re-validaba contra `REAL_MIN_ORDER_VALUE_USD`**
+-- sólo la validación pre-YES tiene ese guard, y estaba calculada contra un
+tamaño que ya no correspondía al fill real.
+
+**Corrección al registro histórico que esta investigación reveló**: los
+incidentes de Al Ittihad y Boca Juniors (2026-09-11) están categorizados en
+CLAUDE.md como "falla de red/cliente genuina", pero **nunca tuvieron
+traceback capturado** -- el fix que persiste `exc_info` en `detail` se
+agregó un día después. Sus presupuestos ($0.44 y $0.93) están en el mismo
+rango bajo $1 que Getafe/Deportivo y Toluca, que sí tuvieron traceback y
+resultaron ser este mismo rechazo. Ver la nota de corrección en la sección
+"Sexta y séptima activación" arriba -- el registro original no se borra,
+sólo se marca como no verificado.
+
+**Fix** (`real_executor.py::_execute_fill`): justo antes de intentar el
+envío HTTP de la pata NO con el presupuesto **recalculado post-fill real de
+YES**, se revalida contra `REAL_MIN_ORDER_VALUE_USD` -- mismo umbral y
+mismo criterio sin margen de tolerancia que la validación pre-YES de la
+Décima activación, pero aplicado al tamaño real en vez de al estimado. Si
+es infeasible, aborta por `_handle_leg_imbalance` (mismo manejo ya
+existente -- `status="pendiente"`, kill-switch global, sin intentar
+deshacer ni reintentar) pero con un evento y motivo **explícitos**
+(`no_leg_infeasible_post_fill`, `_handle_leg_imbalance` gana un parámetro
+`reason` opcional) -- distinto de `order_send_failed` genérico, para no
+perder la distinción que este incidente reveló entre "el exchange nunca
+llegó a intentar la orden porque ya sabíamos que iba a fallar" y "se envió
+y falló por una razón no anticipada" (la que sigue cubriendo el resto de
+los casos, ej. Al Ittihad/Boca Juniors si en efecto fueron fallas de red).
+
+**Posición 23 (Toluca)**: se deja para resolución natural del partido
+(Opción A entre las presentadas, decidida explícitamente por el usuario) --
+no se vendió la pata YES ni se reintentó la pata NO. El kill-switch se
+levantó a mano tras confirmar la causa raíz, sin tocar la posición.
+
+**Tests** (`test_execution_real_executor.py`):
+`test_no_budget_infeasible_post_fill_aborts_before_sending` (fill real muy
+por debajo del estimado -- aborta antes del envío HTTP, nunca se llama a
+`create_and_post_market_order` para NO, evento `no_leg_infeasible_post_fill`
+persistido, `order_send_failed` ausente),
+`test_no_budget_within_range_after_real_fill_sends_normally` (fill real
+dentro de rango normal -- sigue enviando sin cambios, no regresión).
+
+**Variables**: ninguna nueva -- reusa `REAL_MIN_ORDER_VALUE_USD` ya
+existente.
+
+Implementado en la rama `execution/revalidate-min-order-value-post-fill`,
+pendiente de revisión antes de mergear a master.
 
 ### Pendiente para la próxima activación
 
@@ -2041,16 +2141,22 @@ Implementado en la rama `execution/reconciliation-exclude-sin-confirmar-divergen
   funciona como se diseñó la próxima vez que aparezca un caso con la huella
   conocida -- hasta ahora sólo está probada con tests, no contra un
   incidente real.
-- **Confirmado parcialmente el 2026-09-15 (posición 21, Daejeon Citizen
-  FC)**: el bloqueo per-mercado en sí funcionó -- `_handle_unconfirmed_fill`
-  no disparó halt global, sólo bloqueó ese mercado puntual. Pero la
-  reconciliación SÍ terminó globalizando el mismo incidente por una vía
-  separada (ver "Reconciliación: exclusión aritmética de sin_confirmar"
-  abajo) -- fix implementado en la rama `execution/reconciliation-exclude-
-  sin-confirmar-divergence`, pendiente de revisión y merge a master. Sigue
-  faltando confirmar en producción el escenario completo (dos
-  `sin_confirmar` en mercados distintos, ambos operables en paralelo, sin
-  que la reconciliación interfiera) con el fix ya desplegado.
+- **Confirmado el 2026-09-15/16**: bloqueo per-mercado de `sin_confirmar`
+  (posición 21, Daejeon) + exclusión aritmética de reconciliación (posición
+  22, Boca Juniors, ~47min sin halt mientras el partido seguía en curso) --
+  ambos funcionando en producción como se diseñaron, ya mergeados y
+  desplegados. Sigue faltando confirmar el escenario de dos `sin_confirmar`
+  en mercados DISTINTOS a la vez, ambos operables en paralelo (hasta ahora
+  sólo se vio un `sin_confirmar` por vez).
+- **Bug 9 pendiente de revisión y merge** (rama `execution/revalidate-min-
+  order-value-post-fill`, ver sección arriba): revalidación post-fill del
+  presupuesto de NO contra `REAL_MIN_ORDER_VALUE_USD`. No tiene todavía
+  confirmación contra un caso real (el incidente que lo motivó, posición 23
+  Toluca, ya había pasado cuando se implementó el fix).
+- **Posición 23 (Deportivo Toluca FC) sigue sin resolver**, dejada
+  deliberadamente para resolución natural del partido (decisión explícita
+  del usuario, Opción A) -- pata YES sin cobertura ($2.87 comprometidos),
+  requiere seguimiento hasta que `real_resolution_job` la cierre sola.
 
 ## Deploy (Fase 1) — instancia Oracle Cloud
 
