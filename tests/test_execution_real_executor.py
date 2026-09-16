@@ -535,6 +535,81 @@ def test_no_budget_above_minimum_proceeds_normally(request, tmp_path):
         assert positions[0].status == "abierta"
 
 
+def test_no_budget_infeasible_post_fill_aborts_before_sending(request, tmp_path):
+    """Reproduce el incidente de la posición 23 ("Deportivo Toluca FC",
+    2026-09-16, ver CLAUDE.md): la validación pre-YES pasa para el tamaño
+    ESTIMADO (fill.shares=5.5556, presupuesto estimado de NO=$1.11, por
+    encima del mínimo), pero el fill REAL de YES llega mucho más chico
+    (2.0 shares -- el precio saltó de 0.40 estimado a 0.90 real, típico de
+    un mercado deportivo moviéndose en vivo). El presupuesto de NO
+    recalculado para el tamaño real (2.0 x 0.20 = $0.40) cae bajo el
+    mínimo -- debe abortar ANTES de intentar el envío HTTP (nunca se llama
+    a create_and_post_market_order para NO), no dejar que el exchange lo
+    rechace con un 400 después de gastar el ciclo de red."""
+    flag = _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "2.0", "price": "0.90"},
+        ],
+        asks={"no": [{"price": "0.20", "size": "1000"}]},
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert len(client.calls) == 1  # sólo YES -- nunca se intentó enviar NO
+    assert client.calls[0][0] == "yes"
+    with session_factory() as session:
+        pos = session.execute(select(RealPosition)).scalars().one()
+        assert pos.status == "pendiente"
+        assert pos.yes_shares == 2.0
+        assert pos.no_shares == 0.0
+        assert "infeasible post-fill" in pos.notes.lower()
+
+        events = session.execute(select(RealExecutionEvent)).scalars().all()
+        event_types = {e.event_type for e in events}
+        assert "no_leg_infeasible_post_fill" in event_types
+        assert "order_send_failed" not in event_types  # nunca se intentó el envío, no hubo excepción HTTP
+
+        assert kill_switch.is_halted(str(flag)) is True
+
+
+def test_no_budget_within_range_after_real_fill_sends_normally(request, tmp_path):
+    """Contraparte del test anterior -- si el fill real de YES está dentro
+    de un rango razonable respecto a la estimación (sin salto de precio
+    extremo), el presupuesto de NO recalculado sigue por encima del
+    mínimo y la pata NO se envía con normalidad, sin regresión sobre el
+    flujo ya existente."""
+    _enable_real_trading(request, tmp_path)
+    session_factory = _session_factory()
+    client = FakeClient(
+        [
+            {"transactionsHashes": ["0xyes"], "orderID": "yes-order"},
+            {"transactionsHashes": ["0xno"], "orderID": "no-order"},
+        ],
+        trades=[
+            {"taker_order_id": "yes-order", "status": "CONFIRMED", "size": "5.0", "price": "0.44"},
+            {"taker_order_id": "no-order", "status": "CONFIRMED", "size": "5.0", "price": "0.50"},
+        ],
+        asks={"no": [{"price": "0.50", "size": "1000"}]},
+    )
+    engine = RealExecutionEngine(client, session_factory)
+
+    engine.maybe_execute(SPORTS_MARKET, _book("yes", {0.40: 100.0}), _book("no", {0.50: 100.0}))
+
+    assert len(client.calls) == 2  # YES y NO se enviaron con normalidad
+    no_token, no_budget = client.calls[1]
+    assert no_token == "no"
+    assert abs(no_budget - 2.5) < 1e-6  # 5.0 shares reales x 0.50 (book de NO en vivo)
+    with session_factory() as session:
+        pos = session.execute(select(RealPosition)).scalars().one()
+        assert pos.status == "abierta"
+
+
 def test_no_tolerance_margin_added_to_the_minimum_threshold(request, tmp_path):
     """No se agrega ningún colchón de tolerancia a `REAL_MIN_ORDER_VALUE_USD`
     a propósito (ver docstring de `_execute_fill`): es sólo una estimación
